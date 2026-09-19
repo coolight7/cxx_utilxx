@@ -129,9 +129,27 @@ set_target_properties(${_CXX_UTILXX_TARGETS} PROPERTIES
   LINK_LIBRARIES_STRATEGY "REORDER_MINIMALLY"
 )
 
-if (XX_IS_MSVC_D)
-  set_target_properties(cxx_utilxx_shared PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+if (NOT XX_IS_MSVC_D)
+  # GCC/Clang: 默认隐藏全部符号, 仅导出头文件中标注 UTILXX_API 的公开 API
+  # (该宏在 GCC/Clang 下展开为 visibility("default"))。与本项目其它模块一致
+  # (libagentxx / 插件均用 hidden + 白名单), 让链接器可安全裁剪内部符号
+  # (含静态链入的第三方符号与 std 模板实例)。
+  set_target_properties(${_CXX_UTILXX_TARGETS} PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+  )
 endif ()
+
+if (XX_IS_MSVC_D)
+  # 导出面控制 (MSVC): 动态库默认不导出任何符号, 仅导出标注 UTILXX_API 的公开 API。
+  # 不能使用 WINDOWS_EXPORT_ALL_SYMBOLS (CMake 自动导出): 该机制要解析每个 .obj 的
+  # 符号表生成 .def, 而 /GL (LTO) 产物不含符号表 (dumpbin: "ANONYMOUS OBJECT"),
+  # 解析必失败 ("unrecognized file format in 'xxx.obj, 0'"), 即自动导出与 LTO 互斥。
+  target_compile_definitions(cxx_utilxx_shared PRIVATE CXX_UTILXX_EXPORTS)
+endif ()
+
+# 静态链接本库的使用方走此定义: 头文件中的 UTILXX_API 展开为空 (避免 dllimport)
+target_compile_definitions(cxx_utilxx_static PUBLIC CXX_UTILXX_STATIC=1)
 
 set(_CXX_UTILXX_LINK_LIBS
   cxx_utilxx_base_static

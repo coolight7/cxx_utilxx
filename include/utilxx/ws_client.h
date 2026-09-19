@@ -1,6 +1,7 @@
 #pragma once
 
 #include "utilxx_base/asio_error.h"
+#include "utilxx/export.h"
 #include "utilxx_base/log.h"
 #include "utilxx_base/string_util.h"
 #include "asio/awaitable.hpp"
@@ -23,7 +24,7 @@
 
 namespace utilxx {
 
-struct WsMessage {
+struct UTILXX_API WsMessage {
     enum class Type : uint8_t {
         Text,
         Binary,
@@ -51,7 +52,7 @@ struct WsClientConfig {
     size_t                    maxMessageSize = 16 * 1024 * 1024;
 };
 
-class WsClient {
+class UTILXX_API WsClient {
 public:
 
     struct Impl;
@@ -89,7 +90,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-asio::awaitable<std::expected<std::unique_ptr<WsClient>, std::string>> wsConnect(
+asio::awaitable<std::expected<std::unique_ptr<WsClient>, std::string>> UTILXX_API wsConnect(
     asio::any_io_executor                            executor,
     std::string_view                                 url,
     std::vector<std::pair<std::string, std::string>> headers = {},
@@ -97,7 +98,7 @@ asio::awaitable<std::expected<std::unique_ptr<WsClient>, std::string>> wsConnect
 );
 
 /// 从已 accept 的服务端 WS stream 创建 WsClient (供 AgentServer 使用)
-std::unique_ptr<WsClient> wrapAcceptedWs(
+UTILXX_API std::unique_ptr<WsClient> wrapAcceptedWs(
     asio::any_io_executor                                     ex,
     boost::beast::websocket::stream<boost::beast::tcp_stream> ws,
     WsClientConfig                                            config = {}

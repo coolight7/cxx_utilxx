@@ -8,13 +8,15 @@
 #include <stdexcept>
 #include <string>
 
+#include "utilxx/export.h"
+
 namespace utilxx {
 
 /// 上游 API 返回 HTTP 429 (限流) 时抛出
 ///
 /// - `retry_after_seconds()`: 上游 `Retry-After` 头秒数, 无可用值时为 -1
 ///   (调用方优先采用正值, 否则用自身默认退避)
-class RateLimitError : public std::runtime_error {
+class UTILXX_API RateLimitError : public std::runtime_error {
 public:
 
     explicit RateLimitError(const std::string& message, int retry_after_seconds = -1) :

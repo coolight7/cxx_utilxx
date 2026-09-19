@@ -73,3 +73,15 @@ auto json = resp.bodyJson();          // std::optional<utilxx_base::Json>
 Linux / Windows / macOS / Android / iOS 均可编译; HyperScan 与 io_uring 仅在
 Linux (HyperScan 另支持 Windows 受限支持) 生效, 未启用时自动回退 std::regex /
 同步文件 I/O。
+
+## 导出面
+
+动态变体**默认不导出任何符号**, 只有公开头文件中标注 `UTILXX_API` 的 API 才进入
+导出表/导入库 (静态链入的第三方符号、std 模板实例都不会外泄):
+
+- MSVC: 标注展开为 `dllexport` (构建动态库时) / `dllimport` (使用方);
+  静态使用方由目标接口定义 `CXX_UTILXX_STATIC`, 宏展开为空
+- GCC/Clang: 编译期 `-fvisibility=hidden` (+ `-fvisibility-inlines-hidden`),
+  标注展开为 `visibility("default")`
+- 不使用 CMake 的 `WINDOWS_EXPORT_ALL_SYMBOLS`: 该机制要解析每个 `.obj` 的符号表
+  生成 `.def`, 而 `/GL` (LTO) 产物只有编译器中间表示、没有符号表, 二者互斥

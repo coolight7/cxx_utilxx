@@ -1,10 +1,11 @@
 #pragma once
 
 #include "utilxx_base/string_util.h"
+#include "utilxx/export.h"
 
 namespace utilxx {
 
-class HeaderMap {
+class UTILXX_API HeaderMap {
 public:
 
     using _BaseMap = utilxx_base::IgnoreCaseMap<std::vector<std::string>>;

@@ -1,4 +1,5 @@
 #pragma once
+#include "utilxx/export.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -11,7 +12,7 @@ struct XXRegexMatchResult {
     size_t end;
 };
 
-class XXRegex {
+class UTILXX_API XXRegex {
 public:
 
     static const unsigned int defHSFlags_normal;

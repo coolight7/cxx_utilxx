@@ -1,6 +1,7 @@
 #pragma once
 
 #include "utilxx_base/asio_error.h"
+#include "utilxx/export.h"
 #include "utilxx/http_error.h"
 #include "utilxx/http_header.h"
 #include "utilxx_base/json.h"
@@ -30,7 +31,7 @@
 
 namespace utilxx {
 
-struct HttpResponse {
+struct UTILXX_API HttpResponse {
     int         status = 0;
     std::string body;
     HeaderMap   headers;
@@ -87,7 +88,7 @@ struct RequestConfig {
     uint64_t                                 maxResponseBody          = kDefaultMaxResponseBody;
 };
 
-class HttpClient {
+class UTILXX_API HttpClient {
 public:
 
     using RequestConfig = utilxx::RequestConfig;

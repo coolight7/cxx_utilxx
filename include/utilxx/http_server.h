@@ -2,6 +2,7 @@
 
 #include "utilxx_base/asio_error.h"
 #include "utilxx_base/exception.h"
+#include "utilxx/export.h"
 #include "utilxx_base/log.h"
 #include "utilxx/router.h"
 #include "utilxx_base/string_util.h"
@@ -31,23 +32,23 @@
 namespace utilxx {
 
 /// 由 HTTP method 枚举取路由索引 (0-8 对应标准方法)
-int httpMethodIndex(boost::beast::http::verb v) noexcept;
+UTILXX_API int httpMethodIndex(boost::beast::http::verb v) noexcept;
 
 /// 由路由索引取 HTTP method 名称 (0-8); 非法索引返回 "UNKNOWN"
-std::string_view httpMethodName(int methodIdx) noexcept;
+UTILXX_API std::string_view httpMethodName(int methodIdx) noexcept;
 
 /// 去掉请求目标中的 query 部分, 仅返回路径
-std::string_view requestPath(std::string_view target) noexcept;
+UTILXX_API std::string_view requestPath(std::string_view target) noexcept;
 
 /// 将 time_point 格式化为 RFC 7231 IMF-fixdate 字符串
 /// (如 "Sun, 06 Nov 1994 08:49:37 GMT")
-std::string formatHttpDate(std::time_t t) noexcept;
+UTILXX_API std::string formatHttpDate(std::time_t t) noexcept;
 
 // ---------------------------------------------------------------------------
 // HttpServer —— 异步 HTTP/WebSocket/SSE 服务器
 // ---------------------------------------------------------------------------
 
-class HttpServer {
+class UTILXX_API HttpServer {
 public:
 
     using Request  = boost::beast::http::request<boost::beast::http::string_body>;

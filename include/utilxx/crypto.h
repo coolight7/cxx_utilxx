@@ -7,6 +7,8 @@
 #include <string>
 #include <string_view>
 
+#include "utilxx/export.h"
+
 namespace utilxx {
 
 /// 计算字符串的 MD5 散列值
@@ -16,7 +18,7 @@ namespace utilxx {
 ///     - [input] 待计算散列的原始字符串
 ///
 /// - `return` 32 位十六进制 MD5 字符串
-[[nodiscard]] std::string md5Hex(std::string_view input);
+[[nodiscard]] UTILXX_API std::string md5Hex(std::string_view input);
 
 /// 获取本机设备唯一标识
 /// - 基于操作系统机器特征 (Linux machine-id / Windows MachineGuid / Hostname)
@@ -24,6 +26,6 @@ namespace utilxx {
 /// - 结果按进程缓存 (最多计算一次), 避免反复读取系统信息
 ///
 /// - `return` 32 位设备标识 MD5 字符串
-[[nodiscard]] std::string getDeviceId();
+[[nodiscard]] UTILXX_API std::string getDeviceId();
 
 } // namespace utilxx
