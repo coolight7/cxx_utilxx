@@ -248,10 +248,14 @@ public:
     /// - HTTP 429 时抛出 utilxx::RateLimitError (解析 retry-after)
     /// - 其他非 2xx 时抛出 std::runtime_error
     /// - 网络/超时错误抛出 utilxx_base::AsioSystemError
+    ///
+    /// 请求体按值接收 (接住后移动进请求体): 传右值 (如 `std::move(bodyStr)`) 时
+    /// 不产生额外拷贝, 传左值时拷贝一份 (与旧签名一致); 请求对象在本次调用内
+    /// 构建并持有请求体 (含复用失效连接的内部重试), 调用方无需关心其生命周期
     static asio::awaitable<void> requestSseAsync(
         std::string_view                      method,
         std::string_view                      url,
-        std::string_view                      body,
+        std::string                           body,
         std::string_view                      contentType,
         const HeaderMap&                      extraHeaders,
         const RequestConfig&                  config,

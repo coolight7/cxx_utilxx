@@ -1322,7 +1322,7 @@ asio::awaitable<std::expected<HttpResponse, std::string>> HttpClient::requestAsy
 asio::awaitable<void> HttpClient::requestSseAsync(
     std::string_view                      method,
     std::string_view                      url,
-    std::string_view                      body,
+    std::string                           body,
     std::string_view                      contentType,
     const HeaderMap&                      extraHeaders,
     const RequestConfig&                  config,
@@ -1355,7 +1355,9 @@ asio::awaitable<void> HttpClient::requestSseAsync(
         if (!contentType.empty()) {
             req.set(http::field::content_type, contentType);
         }
-        req.body() = body;
+        // 请求体直接移动进请求体 (请求对象在本调用内构建并持有, 含复用失效连接的
+        // 内部重试; 期间调用方不再使用该字符串)
+        req.body() = std::move(body);
         req.prepare_payload();
     }
 
