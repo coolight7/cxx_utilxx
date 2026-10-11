@@ -13,8 +13,8 @@
   文件异步 I/O 的 io_uring 依赖属 `cxx_utilxx_base` (其 `system.cpp` 使用), 经本库
   的链接接口间接传递
 - **命名空间**: `utilxx` (与 `cxx_utilxx_base` 的 `utilxx/cancel.h`、`utilxx/async_offload.h` 同一命名空间)
-- **禁止**依赖 neograph 与任何宿主头文件
-- 数据库 (SQLite) 封装与全局设置库已迁回宿主 `<宿主>/util/` (宿主专用, 本库不提供)
+- **禁止**依赖 neograph 与任何主程序头文件
+- 数据库 (SQLite) 封装与全局设置库已迁回主程序 `<主程序>/util/` (主程序专用, 本库不提供)
 
 ## 目录结构
 

@@ -238,7 +238,7 @@ void HttpServer::startAsync(asio::any_io_executor executor) {
 asio::awaitable<void> HttpServer::serveTcp(std::shared_ptr<boost::beast::tcp_stream> stream) {
     ConnectionGuard guard{activeConnections_};
     // 捕获异常, 避免客户端在读写期间断开时异常逃逸 detached 协程 → terminate;
-    // 取消/中断是预期行为 (见 utilxx::CancelledException 与宿主注册的控制流
+    // 取消/中断是预期行为 (见 utilxx::CancelledException 与主程序注册的控制流
     // 异常识别 utilxx_base::setExtraExceptionClassifier), 静默返回
     try {
         co_await serve(std::move(*stream));
