@@ -98,7 +98,8 @@ std::string readPlatformRawDeviceId() {
         return std::string(hostname);
     }
 #endif
-    return "agentxx_default_device";
+    // 读不到任何机器特征时的兜底值: 固定串 (同一机器上仍能算出稳定 id)
+    return "unknown_device";
 }
 
 } // namespace

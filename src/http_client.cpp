@@ -39,7 +39,7 @@ namespace {
 std::atomic<bool> g_poolAlive{false};
 
 /// 启用 TCP keepalive 并缩短探测间隔 (OS 默认 idle 常为 2 小时, 毫无作用)。
-/// LLM 流式响应存在长时间无数据的空窗期 (如 content 结束后等待 tool_call 下发),
+/// 流式响应存在长时间无数据的空窗期 (如首字节前的排队或模型思考),
 /// 中间 NAT/负载均衡/网关会静默丢弃空闲连接, 导致 stream truncated / connection
 /// reset 等错误; keepalive 探测包可在空窗期维持中间设备状态, 避免连接被丢弃。
 /// best-effort: 设置失败不影响正常请求。
@@ -253,7 +253,7 @@ asio::awaitable<asio::ip::tcp::resolver::results_type> waitDnsResolve(
 // ---------------------------------------------------------------------------
 // HTTP 连接池 (keep-alive 连接复用)
 //
-// 背景: 如果每次请求都新建 TCP+TLS 连接、响应后立即关闭, LLM API 调用频繁时
+// 背景: 如果每次请求都新建 TCP+TLS 连接、响应后立即关闭, 高频 API 调用时
 // 每次都要付出 DNS 解析 + TCP 握手 + TLS 握手 (100ms~1s+) 的建连开销。连接池
 // 将空闲连接缓存复用, 同时把同一端点的并发连接数限制在可配置上限内。
 //
@@ -268,7 +268,7 @@ asio::awaitable<asio::ip::tcp::resolver::results_type> waitDnsResolve(
 // - 并发达到上限时轮询等待 (kPoolWaitPollInterval), 等待可被取消且不改池状态
 // - 线程安全: 池状态用互斥锁保护; 连接的读写由借出的协程独占, 无并发访问
 // - 连接绑定创建它的 io_context (socket 的 any_io_executor): 复用期间该
-//   io_context 必须存活 (本项目 LLM 调用集中在 agent 的 io_context, 满足要求)
+//   io_context 必须存活 (调用方须保证执行器生命周期覆盖连接池)
 // ---------------------------------------------------------------------------
 
 /// 连接池键: 同一端点 (协议+主机+端口+证书校验) 的连接可互相复用
@@ -994,16 +994,26 @@ std::string HttpClient::resolveRedirectUrl(
 }
 
 const HeaderMap& HttpClient::defaultHeaders() {
-    static const HeaderMap headers = [] {
-        HeaderMap h;
+    // 默认头缓存: 内容只依赖当前产品标识 (产品名可在运行期经
+    // utilxx_base::setProductName 设置), 标识变化时重建一份新快照。
+    // 旧快照不释放 —— 其它线程可能仍持有它返回的引用; 产品名通常在启动时
+    // 设置一次, 因此最多重建一次。
+    static std::mutex           mutex;
+    static const HeaderMap*     cached = nullptr;
+    static std::string          cachedToken;
+    std::lock_guard<std::mutex> lock{mutex};
+    std::string                 token = utilxx_base::productToken();
+    if (cached == nullptr || token != cachedToken) {
+        auto* headers = new HeaderMap{};
         // User-Agent 遵循 RFC 9110: product = token ["/" product-version],
-        // 用 Agentxx/<版本号> 标识本客户端身份, 便于服务端识别与统计
-        h.set("User-Agent", "Agentxx/" + std::string{utilxx_base::kVersion});
-        h.set("Accept", "*/*");
-        h.set("Accept-Language", "zh-CN,zh;q=0.9");
-        return h;
-    }();
-    return headers;
+        // 用 `产品名/版本号` 标识本客户端身份, 便于服务端识别与统计
+        headers->set("User-Agent", token);
+        headers->set("Accept", "*/*");
+        headers->set("Accept-Language", "zh-CN,zh;q=0.9");
+        cached      = headers;
+        cachedToken = std::move(token);
+    }
+    return *cached;
 }
 
 void HttpClient::enableTlsAutoNegotiate(asio::ssl::context& ctx) {

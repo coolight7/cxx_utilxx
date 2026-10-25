@@ -2,7 +2,7 @@
 
 /// 设备标识与散列 (MD5 / 设备唯一标识)
 ///
-/// 由原 `agentxx/util/util.h` 拆分的散列部分, 依赖 OpenSSL EVP。
+/// 基于 OpenSSL EVP 实现的散列与设备标识工具。
 
 #include <string>
 #include <string_view>

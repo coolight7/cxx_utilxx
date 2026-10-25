@@ -1,8 +1,8 @@
 /// HTTP 错误类型 (utilxx::RateLimitError)
 ///
-/// - 从 `neograph::RateLimitError` 迁移而来: util 层不再依赖图引擎头,
-///   限流语义由 util 自有类型表达
-/// - 与 neograph 版本二进制无关, 仅按消息 + retry-after 秒数传递
+/// - 从业务引擎自带的限流错误类型中拆分出来: util 层不依赖任何引擎头,
+///   限流语义由本库自有类型表达
+/// - 与调用方使用的引擎/框架二进制无关, 仅按消息 + retry-after 秒数传递
 #pragma once
 
 #include <stdexcept>

@@ -1,8 +1,9 @@
-# ===== cxx_utilxx: 重依赖工具库 (HTTP/WS/正则/路由/差异/worktree/散列) =====
+# ===== cxx_utilxx: 重依赖工具库 (HTTP/WS/正则/路由/差异/散列) =====
 #
 # 定位: 基于 cxx_utilxx_base, 提供网络与通用工具; 依赖 OpenSSL / Boost
-# (beast + process) / fmt / html2md, 可选 hyperscan (正则);
-# 注: 数据库 (SQLite) 相关工具已迁回宿主 (agentxx/lib/.../util), 本库不含数据库依赖
+# (beast) / fmt / html2md, 可选 hyperscan (正则);
+# 注: 数据库 (SQLite) 封装、版本管理与工作树 (git worktree) 一类与具体主程序
+# 业务绑定的工具由主程序自行实现, 本库不提供
 # 文件异步 I/O 的 io_uring 依赖在 cxx_utilxx_base (见该库 CMakeLists)
 # 产物 (命名规则: Release 无后缀, Debug 文件名追加 d):
 #   Release: libcxx_utilxx.so        libcxx_utilxx_static.a
@@ -46,7 +47,6 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/xx_platform_macros.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/xx_rpath.cmake")
 
 option(CXX_UTILXX_ENABLE_HYPERSCAN "Use HyperScan for regex (std::regex if off)." OFF)
-option(CXX_UTILXX_ENABLE_BOOST_PROCESS "Use Boost.process for worktree commands." ON)
 # 注: Linux io_uring 依赖 (asio 文件异步 I/O) 已随实现 (system.cpp 的运行时探测)
 # 移到 cxx_utilxx_base, 由该库的 CXX_UTILXX_BASE_LINUX_IO_URING_SUPPORTED 开关处理
 
@@ -62,9 +62,6 @@ if (XX_LINUX_IO_URING_SUPPORTED)
   pkg_check_modules(uring REQUIRED IMPORTED_TARGET liburing)
 endif ()
 find_package(Boost CONFIG REQUIRED)
-if (CXX_UTILXX_ENABLE_BOOST_PROCESS)
-  find_package(Boost CONFIG REQUIRED COMPONENTS process)
-endif ()
 find_package(OpenSSL REQUIRED)
 find_package(fmt REQUIRED)
 find_package(html2md REQUIRED)
@@ -132,7 +129,7 @@ set_target_properties(${_CXX_UTILXX_TARGETS} PROPERTIES
 if (NOT XX_IS_MSVC_D)
   # GCC/Clang: 默认隐藏全部符号, 仅导出头文件中标注 UTILXX_API 的公开 API
   # (该宏在 GCC/Clang 下展开为 visibility("default"))。与本项目其它模块一致
-  # (libagentxx / 插件均用 hidden + 白名单), 让链接器可安全裁剪内部符号
+  # (主程序库/插件均用 hidden + 白名单), 让链接器可安全裁剪内部符号
   # (含静态链入的第三方符号与 std 模板实例)。
   set_target_properties(${_CXX_UTILXX_TARGETS} PROPERTIES
     CXX_VISIBILITY_PRESET hidden
@@ -158,9 +155,6 @@ set(_CXX_UTILXX_LINK_LIBS
   OpenSSL::Crypto
   html2md
 )
-if (CXX_UTILXX_ENABLE_BOOST_PROCESS)
-  list(APPEND _CXX_UTILXX_LINK_LIBS Boost::process)
-endif ()
 list(APPEND _CXX_UTILXX_LINK_LIBS ${_CXX_UTILXX_EXTRA_LIBS})
 
 foreach (_t ${_CXX_UTILXX_TARGETS})
@@ -172,7 +166,6 @@ foreach (_t ${_CXX_UTILXX_TARGETS})
     ASIO_NO_DEPRECATED=1
     BOOST_ASIO_HAS_STD_INVOKE_RESULT=1
     ASIO_HAS_STD_INVOKE_RESULT=1
-    BOOST_PROCESS_USE_STD_FS=1
     BOOST_EXCEPTION_MINI_BOOST=1
     UTILXX_USE_BOOST_ASIO=1
   )

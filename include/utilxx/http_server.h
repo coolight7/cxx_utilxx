@@ -86,7 +86,7 @@ public:
         unsigned             ioThreads = 0; // 0 = hardware_concurrency
         std::chrono::seconds requestTimeout{30};
 
-        /// SSE 写入超时: 两次 SSE event 推送之间的最大间隔 (默认 120s, 适应 LLM 长思考)
+        /// SSE 写入超时: 两次 SSE event 推送之间的最大间隔 (默认 120s, 适应长耗时推送)
         std::chrono::seconds sseWriteTimeout{120};
 
         size_t maxConnections = 8192;
@@ -222,7 +222,7 @@ private:
                     XX_LOGE("[sse] write response error: {}", errinfo);
                     co_return false;
                 }
-                // 不传 onRethrow: CancelledException/NodeInterrupt 保持抛出 (项目约定),
+                // 不传 onRethrow: 取消类异常保持抛出 (调用方约定),
                 // 避免取消被吞掉后 SSE 流无法终止
             );
         }
@@ -268,7 +268,7 @@ private:
                     XX_LOGE("[sse] write error: {}", errinfo);
                     co_return false;
                 }
-                // 不传 onRethrow: CancelledException/NodeInterrupt 保持抛出 (项目约定)
+                // 不传 onRethrow: 取消类异常保持抛出 (调用方约定)
             );
         }
 
@@ -429,8 +429,9 @@ private:
             // 构造响应
             Response resp;
             resp.version(req.version());
-            static const std::string kServerBanner = "agentxx/" + std::string{utilxx_base::kVersion};
-            resp.set(http::field::server, kServerBanner);
+            // Server 头: `产品名/版本号`, 产品名由使用方经
+            // utilxx_base::setProductName 设置 (默认取库名)
+            resp.set(http::field::server, utilxx_base::productToken());
             // RFC 7231: 服务器应包含 Date 头
             resp.set(http::field::date, formatHttpDate(std::time(nullptr)));
 
@@ -446,7 +447,7 @@ private:
                 if (sseIt != sseRoutes_.end()) {
                     // handler 异常统一经 catchErrorAsync 处理: 若尚未发送任何 SSE
                     // 数据, 经 writer 回写 500 响应; 已发送则连接随后关闭。
-                    // CancelledException/NodeInterrupt 保持抛出 (无 onRethrow) 终止本连接
+                    // 取消类异常保持抛出 (无 onRethrow) 终止本连接
                     auto writer
                         = std::make_shared<SseWriterImpl<Stream>>(stream, config_.sseWriteTimeout);
                     auto sseOk = co_await utilxx_base::catchErrorAsync<bool>(
@@ -524,7 +525,7 @@ private:
                     && boost::beast::iequals(upgradeIt->value(), "websocket")) {
                     // WS 升级/处理异常统一经 catchErrorAsync 处理; 升级失败或 handler
                     // 异常时连接已不可用 (ws stream 析构即关闭), 标记已处理避免回落
-                    // 普通路由; CancelledException/NodeInterrupt 保持抛出 (无 onRethrow)
+                    // 普通路由; 取消类异常保持抛出 (无 onRethrow)
                     auto wsOk = co_await utilxx_base::catchErrorAsync<bool>(
                         [&]() -> asio::awaitable<bool> {
                             auto wsIt = wsRoutes_.find(path);
@@ -574,7 +575,7 @@ private:
                 }
                 if (handler && *handler) {
                     // handler 异常统一经 catchErrorAsync 转为 500;
-                    // CancelledException/NodeInterrupt 保持抛出 (无 onRethrow)
+                    // 取消类异常保持抛出 (无 onRethrow)
                     handled = co_await utilxx_base::catchErrorAsync<bool>(
                         [&]() -> asio::awaitable<bool> {
                             co_await (*handler)(req, resp, matchedPath);

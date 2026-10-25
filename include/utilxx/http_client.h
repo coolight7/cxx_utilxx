@@ -73,7 +73,7 @@ inline constexpr uint64_t kDefaultMaxResponseBody = 10 * 1024 * 1024;
 ///   总超时 —— 只要数据持续到达, 连接就一直保持
 /// - keepAlive: 启用 HTTP keep-alive + 连接池复用 (见 maxConcurrentConnections)。
 ///   false (默认) 时请求头带 Connection: close, 每次新建连接、响应后立即关闭。
-///   LLM 提供者等高频长连接端点需显式启用以复用连接池。
+///   流式 API 等高频长连接端点需显式启用以复用连接池。
 /// - maxConcurrentConnections: keepAlive=true 时生效, 每个端点
 ///   (scheme://host:port + sslVerify) 的最大并发连接数; 默认 5, 0 = 不限制
 ///   (仍复用空闲连接)。超过上限的并发请求排队等待空闲连接。
@@ -112,7 +112,10 @@ public:
     static std::string
         resolveRedirectUrl(std::string_view originalUrl, std::string_view location) noexcept;
 
-    static const HeaderMap& defaultHeaders();
+    /// 默认请求头 (User-Agent / Accept / Accept-Language)
+    /// - User-Agent 取当前产品标识 (见 utilxx_base::setProductName / productToken)
+    /// - 返回的引用在进程内稳定; 产品名变化后会换成新的快照
+    [[nodiscard]] static const HeaderMap& defaultHeaders();
 
     // -----------------------------------------------------------------------
     // 共享 SSL context 池 —— 避免每个请求都创建 OpenSSL context
@@ -192,7 +195,7 @@ public:
                 // 编码不完整 / 网关超时掐断), beast 报 partial_message。原始错误信息
                 // 只含 "partial message [beast.http:2 ...]" 无任何请求上下文, 甚至
                 // 无法区分是响应头还是 body 阶段失败, 这里转换为带状态与已收字节数
-                // 的友好提示, 便于上层 (LLM/provider/MCP) 诊断与识别瞬时错误。
+                // 的友好提示, 便于上层 (业务/协议层) 诊断与识别瞬时错误。
                 // 注意: 该错误是"响应被截断", 不代表请求失败, 服务器可能已处理完
                 // 请求, 仅响应在传输中丢失; 幂等/可容忍重复执行的请求可安全重试。
                 if (e.code() == http::error::partial_message) {

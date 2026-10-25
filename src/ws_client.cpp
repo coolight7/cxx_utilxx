@@ -13,6 +13,7 @@
 #include "utilxx/ws_client.h"
 
 #include "utilxx_base/exception.h"
+#include "utilxx_base/version.h"
 #include "utilxx/http_client.h"
 #include <algorithm>
 #include <cctype>
@@ -429,9 +430,10 @@ asio::awaitable<std::expected<std::unique_ptr<WsClient>, std::string>> wsConnect
 
     // UA + 自定义头统一在一个 decorator 内设置 (set_option(decorator) 是覆盖语义,
     // 分两次设置会丢失先设置的部分)
-    // User-Agent 遵循 RFC 9110: product = token ["/" product-version]
+    // User-Agent 遵循 RFC 9110: product = token ["/" product-version];
+    // 默认取产品标识, 调用方传入同名头时在下方循环里覆盖
     auto decorateRequest = [headers](ws::request_type& req) {
-        req.set(boost::beast::http::field::user_agent, "agentxx/1.0.0");
+        req.set(boost::beast::http::field::user_agent, utilxx_base::productToken());
         for (const auto& [k, v] : headers) {
             req.set(k, v);
         }
@@ -439,7 +441,7 @@ asio::awaitable<std::expected<std::unique_ptr<WsClient>, std::string>> wsConnect
 
     // 连接各阶段错误 (DNS/TCP/TLS/WS 握手超时、系统错误等) 统一经
     // utilxx_base::catchErrorToUnexpectedAsync 转为错误字符串 (含 UTF-8 转换);
-    // CancelledException/NodeInterrupt 保持抛出, 不阻断 BaseAgent 取消处理
+    // 取消类异常保持抛出, 不阻断调用方的取消处理
     co_return co_await utilxx_base::catchErrorToUnexpectedAsync<std::unique_ptr<WsClient>>(
         [&]() -> asio::awaitable<std::expected<std::unique_ptr<WsClient>, std::string>> {
             // DNS 解析不能直接 co_await: getaddrinfo 阻塞无法被取消/超时中断,
