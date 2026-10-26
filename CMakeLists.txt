@@ -83,7 +83,7 @@ set(_CXX_UTILXX_SOURCES
 #   PkgConfig::hyperscan —— 按本库包 config 的开关 cxx_utilxx_ENABLE_HYPERSCAN
 #                           (或本构建开关 CXX_UTILXX_ENABLE_HYPERSCAN) 写
 #                           pkg_check_modules(hyperscan REQUIRED IMPORTED_TARGET libhs),
-#                           宿主构建按其顶层开关判断
+#                           主程序构建按其顶层开关判断
 #   hs_runtime           —— HyperScan 运行期库 (libhs.pc 未覆盖), 按裸库名声明,
 #                           经下方 target_link_directories 传播的
 #                           ${XX_INSTALL_DIR}/lib 解析 (该目录只有 .a, 静态链接)

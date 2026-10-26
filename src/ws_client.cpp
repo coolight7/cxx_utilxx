@@ -310,7 +310,7 @@ asio::awaitable<std::expected<WsMessage, std::string>> WsClient::recv() {
                 // 其余错误交由 catchErrorAsync 统一处理
                 if (e.code() == boost::beast::websocket::error::closed) {
                     impl_->closed_ = true;
-                    // 透传对端 close 帧携带的 code/reason (reason() 在 close 处理后可用)
+                    // 原样转发对端 close 帧携带的 code/reason (reason() 在 close 处理后可用)
                     auto      cr = impl_->isSsl ? impl_->wss->reason() : impl_->ws->reason();
                     WsMessage msg;
                     msg.type        = WsMessage::Type::Close;

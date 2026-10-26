@@ -252,7 +252,7 @@ public:
     /// 添加路由
     /// - 允许使用通配符 *
     /// - 允许同时设置多个类型枚举
-    /// - 路径中连续的 / 将被视为仅一个 /，结尾的 / 将被忽略（文件夹路径与文件路径等价注册）
+    /// - 路径中连续的 / 会被视为仅一个 /，结尾的 / 会被忽略（文件夹路径与文件路径等价注册）
     /// - 即 /a//b///c 等同于 /a/b/c；/a/b/ 等同于 /a/b
     bool add(std::string_view in_path, int in_index, std::shared_ptr<HANLDE_TPYE> in_fun) {
         cacheMap_.clear();

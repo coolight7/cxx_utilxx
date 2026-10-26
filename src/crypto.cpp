@@ -98,7 +98,7 @@ std::string readPlatformRawDeviceId() {
         return std::string(hostname);
     }
 #endif
-    // 读不到任何机器特征时的兜底值: 固定串 (同一机器上仍能算出稳定 id)
+    // 读不到任何机器特征时的回退值: 固定串 (同一机器上仍能算出稳定 id)
     return "unknown_device";
 }
 
@@ -111,7 +111,7 @@ std::string md5Hex(std::string_view input) {
     if (ctx) {
         if (EVP_DigestInit_ex(ctx, EVP_md5(), nullptr) == 1) {
             EVP_DigestUpdate(ctx, input.data(), input.size());
-            // 取摘要失败时保持 digestLen == 0, 交由下方兜底
+            // 取摘要失败时保持 digestLen == 0, 交由下方回退处理
             if (EVP_DigestFinal_ex(ctx, digest, &digestLen) != 1) {
                 digestLen = 0;
             }

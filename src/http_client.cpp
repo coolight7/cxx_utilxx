@@ -341,8 +341,8 @@ asio::awaitable<std::shared_ptr<PooledConnection>>
 /// 即使服务端提前断开, 复用失败也会自动用新连接重试一次 (见 isPoolRetryableError)。
 inline constexpr auto kPoolIdleTimeout = std::chrono::seconds{120};
 
-/// 并发上限等待时的兜底超时: 正常情况下由 release/建连失败精准唤醒等待队列,
-/// 消除 50ms 忙轮询与突发请求惊群; 30s 作为安全兜底超时
+/// 并发上限等待时的备用超时: 正常情况下由 release/建连失败精准唤醒等待队列,
+/// 消除 50ms 忙轮询与突发请求惊群; 30s 作为安全备用超时
 inline constexpr auto kPoolWaitTimeout = std::chrono::seconds{30};
 
 /// 复用失效重试判定: 仅当错误表明"连接在对端已被关闭/重置" (请求几乎未到达
@@ -365,7 +365,7 @@ bool isPoolRetryableError(const utilxx_base::AsioErrorCode& ec, std::string_view
             return true;
         }
     }
-    // 兜底: 文本匹配 (非 asio 错误 / 被包装的错误消息)
+    // 回退: 文本匹配 (非 asio 错误 / 被包装的错误消息)
     if (errmsg.empty()) {
         return false;
     }
@@ -476,7 +476,7 @@ public:
                     throw;
                 }
             }
-            // 并发达到上限: 挂入等待队列, release/新建失败时精准唤醒 (带 30s 兜底超时与取消保护)
+            // 并发达到上限: 挂入等待队列, release/新建失败时精准唤醒 (带 30s 备用超时与取消保护)
             if (waiter) {
                 struct WaiterGuard {
                     std::mutex&                                    mtx;
