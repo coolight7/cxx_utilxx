@@ -391,6 +391,11 @@ asio::awaitable<std::expected<std::unique_ptr<WsClient>, std::string>> wsConnect
         if (colon != std::string::npos) {
             host = hostPort.substr(0, colon);
             port = hostPort.substr(colon + 1);
+        } else {
+            // 没写端口 (如 `wss://api.example.com/websocket`): 整段都是 host,
+            // 端口按协议取默认值 (下面补齐)。漏掉这条分支会让 host 保持空串,
+            // 直接报 "empty host in ws url" —— 只有带端口的地址能用。
+            host = hostPort;
         }
     }
     if (port.empty()) {
