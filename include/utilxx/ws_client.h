@@ -52,6 +52,12 @@ struct WsClientConfig {
     size_t                    maxMessageSize = 16 * 1024 * 1024;
 };
 
+/// WebSocket 客户端
+/// - 收发接口不外抛异常: 失败一律以 `std::expected` 的错误串返回 (取消类异常仍抛出)
+/// - **析构安全**: 挂起中的 send/recv 各自持有实现体的强引用, 所以
+///   `abort()` 之后立即析构本对象不会让协程读到已释放的内存 (abort 只是关闭
+///   socket, 挂起操作的完成回调要等线程回到 io_context 才会执行)
+/// - `payload` 是视图: 挂起期间调用方的缓冲必须有效; 已发送完的分块不再引用它
 class UTILXX_API WsClient {
 public:
 
@@ -82,12 +88,17 @@ public:
 
     /// 关闭底层 socket, 使挂起的 recv/send 以错误返回
     /// - 须在 WsClient 绑定的 executor 上调用 (与 recv/send 同线程)
-    /// - 调用后 recv 会立即以错误返回, 此后方可安全析构 WsClient
+    /// - 关闭后挂起的操作**不会当场返回**: 它们的完成回调同样要经 io_context 派发,
+    ///   因此可以紧接 `abort()` 就析构 WsClient (实现体由挂起的协程各自持有)
     void abort() noexcept;
 
 private:
 
-    std::unique_ptr<Impl> impl_;
+    /// 实现体 (按强引用持有)
+    ///
+    /// 收发协程在**调用当刻**就把这份引用复制进协程帧, 因此
+    /// `abort()` + 析构 WsClient 之后, 挂起中的协程仍然可以安全收尾 (见 ws_client.cpp)
+    std::shared_ptr<Impl> impl_;
 };
 
 asio::awaitable<std::expected<std::unique_ptr<WsClient>, std::string>> UTILXX_API wsConnect(
