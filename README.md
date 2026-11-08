@@ -5,10 +5,12 @@
 ## 定位
 
 - **用途**: HTTP 客户端与服务端 (Boost.Beast + OpenSSL)、WebSocket 客户端、
-  正则 (HyperScan 或 std::regex)、Aho-Corasick、路由、文本差异、
-  MD5/设备标识
+  插件网络宿主 (HTTP / TCP / WebSocket / UDP 的客户端与服务端 + 按插件隔离,
+  `utilxx/plugin_net_hub.h`)、正则 (HyperScan 或 std::regex)、Aho-Corasick、路由、
+  文本差异、MD5/设备标识
 - **依赖**: `cxx_utilxx_base` (基础件与取消抽象)、Boost (beast/asio, 仅头文件)、
-  OpenSSL、fmt、html2md; 可选 HyperScan (正则加速, 导出接口以库名
+  OpenSSL、fmt、html2md、`cxx_pluginxx` (只有插件网络宿主用它的通用表定义
+  `pluginxx/api/net.h`, 纯头文件); 可选 HyperScan (正则加速, 导出接口以库名
   `PkgConfig::hyperscan` + `hs_runtime` 声明, 具体库由使用方解析)。
   文件异步 I/O 的 io_uring 依赖属 `cxx_utilxx_base` (其 `system.cpp` 使用), 经本库
   的链接接口间接传递
@@ -26,7 +28,9 @@ include/utilxx/
   http_client.h  http_header.h  http_error.h  http_server.h  ws_client.h
   router.h  regex.h  aho_corasick.h
   diff_util.h  crypto.h
-src/                    实现 (crypto/http_client/http_header/http_server/regex/ws_client)
+  plugin_net_hub.h  plugin_net_hub_tls.h   # 插件网络宿主 (实现插件框架的 <应用名>.net 表)
+src/                    实现 (crypto/http_client/http_header/http_server/regex/ws_client
+                        /plugin_net_hub/plugin_net_hub_tls)
 ```
 
 ## 构建与使用
