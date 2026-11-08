@@ -58,6 +58,18 @@ struct UTILXX_API HttpResponse {
 /// 默认最大响应体大小 (10 MB), 防止内存耗尽
 inline constexpr uint64_t kDefaultMaxResponseBody = 10 * 1024 * 1024;
 
+/// 一次流式下载 (`HttpClient::downloadAsync`) 的结果
+struct UTILXX_API DownloadResult {
+    /// HTTP 状态码（只有 2xx 才会成功返回）
+    int         status = 0;
+    /// 实际写入的文件路径（= 调用方传入的路径）
+    std::string filePath;
+    /// 写入字节数
+    uint64_t bytes = 0;
+    /// 响应头（`Content-Length` / `Content-Type` 等）
+    HeaderMap headers;
+};
+
 /// 单次请求配置 (低频定制项)
 /// - connectTimeout: DNS 解析 + TCP 连接 + TLS 握手 的总期限。三个阶段共享
 ///   同一期限, 最坏总耗时恰为 connectTimeout (而不是分段限制的 3 倍)。
@@ -277,6 +289,21 @@ public:
         std::string_view                      port,
         std::chrono::steady_clock::time_point connectDeadline,
         std::chrono::milliseconds             connectTimeout
+    );
+
+    /// 阻塞式下载：把响应体**边读边写**到 `filePath`（不占内存），逐块回调进度
+    ///
+    /// - 只发 GET；`extraHeaders` 可用来带 `Range` / 鉴权头；重定向跟 `config.followRedirect`
+    /// - 正文大小受 `config.maxResponseBody` 限制（超出按失败处理并删除半成品文件）
+    /// - 非 2xx / 网络错误 / 取消都返回错误串，且**删除**已写入的部分文件
+    /// - 取消：外部用 `asio::co_spawn` 的 cancellation 传播进来即可（与其它 awaitable 一致）
+    /// - `onProgress(received, total)`：`total` 为 `Content-Length`（分块传输 / 无该头时为空）
+    static asio::awaitable<std::expected<DownloadResult, std::string>> downloadAsync(
+        std::string_view                                      url,
+        std::string_view                                      filePath,
+        const HeaderMap&                                      extraHeaders,
+        const RequestConfig&                                  config,
+        std::function<void(uint64_t, std::optional<uint64_t>)> onProgress = {}
     );
 
     /// 启用/禁用 SSL 证书校验 (默认启用)
