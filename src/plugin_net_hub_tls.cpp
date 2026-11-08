@@ -213,6 +213,11 @@ tlsContextFor(const TlsClientOptions &options, std::string &error) {
 
 } // namespace
 
+std::shared_ptr<asio::ssl::context>
+    tlsClientContext(const TlsClientOptions &options, std::string &error) {
+  return tlsContextFor(options, error);
+}
+
 bool NetStream::tlsSupported() { return true; }
 
 bool NetStream::prepareTls(const TlsClientOptions &options) {

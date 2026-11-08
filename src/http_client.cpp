@@ -306,6 +306,8 @@ struct PooledConnection {
         stream(std::in_place_index<0>, std::move(executor)) {}
 
     std::variant<asio::ip::tcp::socket, asio::ssl::stream<asio::ip::tcp::socket>> stream;
+    /// 本次连接用的 TLS 上下文（调用方传了自己的就留一份强引用，保证流活着时上下文也在）
+    std::shared_ptr<asio::ssl::context>                                         sslCtx;
     std::chrono::steady_clock::time_point                                         lastUsed;
     bool fresh = true; ///< 本次是否新建 (非复用), 供失效重试决策
 };
@@ -701,11 +703,29 @@ asio::awaitable<std::shared_ptr<PooledConnection>>
 
     auto conn = std::make_shared<PooledConnection>(executor);
     if (key.https) {
-        auto& sslCtx = HttpClient::sharedSslCtx(key.verify);
-        auto& stream = conn->stream.emplace<asio::ssl::stream<tcp::socket>>(executor, sslCtx);
+        // 调用方给了自己的上下文（插件网络要额外信任的 CA）就用它，否则用进程共享的那个
+        asio::ssl::context* ctx = &HttpClient::sharedSslCtx(key.verify);
+        if (config.sslContext) {
+            conn->sslCtx = config.sslContext;
+            ctx          = conn->sslCtx.get();
+        }
+        auto& stream = conn->stream.emplace<asio::ssl::stream<tcp::socket>>(executor, *ctx);
         // SNI 只能是域名, IP 字面量 (IPv6 含 ':') 不支持 SNI
-        if (!key.host.empty() && key.host.find(':') == std::string::npos) {
-            ::SSL_set_tlsext_host_name(stream.native_handle(), key.host.c_str());
+        const std::string sni = config.sslServerName.empty() ? key.host : config.sslServerName;
+        if (!sni.empty() && sni.find(':') == std::string::npos) {
+            ::SSL_set_tlsext_host_name(stream.native_handle(), sni.c_str());
+        }
+        // 主机名校验: 插件客户端要校验证书里的名字与地址是否匹配 (库里默认只校链)
+        if (config.sslVerifyHost && !sni.empty()) {
+            SSL*             ssl = stream.native_handle();
+            utilxx_base::AsioErrorCode addressEc;
+            const auto       address = asio::ip::make_address(sni, addressEc);
+            if (addressEc) {
+                ::SSL_set1_host(ssl, sni.c_str());
+            } else {
+                // IP 字面量: 证书里要有对应的 IP SAN (DNS 名校验对 IP 不适用)
+                ::X509_VERIFY_PARAM_set1_ip_asc(::SSL_get0_param(ssl), sni.c_str());
+            }
         }
         co_await asio::async_connect(
             stream.lowest_layer(),
@@ -1224,7 +1244,10 @@ asio::awaitable<std::expected<HttpResponse, std::string>> HttpClient::requestAsy
 
                 // 连接池: keepAlive=true 时启用 (复用空闲连接 + 并发上限), 否则保持
                 // 旧行为 (每次新建连接, 响应后关闭, 不受并发上限约束)
-                bool   usePool  = config.keepAlive;
+                // 本次请求带了自己的 TLS 上下文 / 主机名校验选项时不走池: 池键装不下这些差异
+                const bool customTls = config.sslContext != nullptr || config.sslVerifyHost
+                                       || !config.sslServerName.empty();
+                bool   usePool  = config.keepAlive && !customTls;
                 size_t poolMax  = usePool ? config.maxConcurrentConnections : 0;
                 int maxAttempts = usePool ? 2 : 1; // 复用失效连接时用新连接重试一次
 
@@ -1309,6 +1332,7 @@ asio::awaitable<std::expected<HttpResponse, std::string>> HttpClient::requestAsy
         if (!result.has_value()) {
             break;
         }
+        result->redirects = redirectCount;
         if (redirectCount >= config.followRedirect) {
             break;
         }

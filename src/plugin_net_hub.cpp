@@ -14,6 +14,7 @@
 
 #include "utilxx/plugin_net_hub_tls.h"
 
+#include "utilxx/http_client.h"
 #include "utilxx/udp.h"
 
 
@@ -22,7 +23,9 @@
 #include "utilxx_base/log.h"
 #include "utilxx_base/string_util.h"
 
+#include <asio/bind_cancellation_slot.hpp>
 #include <asio/buffer.hpp>
+#include <asio/cancellation_signal.hpp>
 #include <asio/connect.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/error.hpp>
@@ -38,6 +41,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -558,11 +562,6 @@ std::string hostHeaderOf(const ParsedUrl &url) {
   return host + ":" + std::to_string(url.port);
 }
 
-/// 协议 + 主机 + 端口 (拼绝对地址用; 默认端口不写)
-std::string originOf(const ParsedUrl &url) {
-  return url.scheme + "://" + hostHeaderOf(url);
-}
-
 /// 扩展名 → Content-Type (只覆盖音频/视频/文本这几类常见格式)
 std::string contentTypeOfName(const std::string &name) {
   const size_t dot = name.find_last_of('.');
@@ -891,173 +890,6 @@ void splitTarget(std::string_view target, std::string &path, std::string &query)
   query = std::string{target.substr(mark + 1)};
 }
 
-/// HTTP 正文解码 (Content-Length / chunked / 读到断开)
-class HttpBodyDecoder {
-public:
-  enum class Mode { None, Length, Chunked, UntilClose };
-
-  void init(Mode mode, int64_t length, int64_t maxBytes) {
-    mode_ = mode;
-    remaining_ = length;
-    // `maxBytes <= 0` = 不限制（插件自己决定要不要给上限）
-    maxBytes_ = maxBytes > 0 ? maxBytes : (std::numeric_limits<int64_t>::max)();
-    done_ = mode == Mode::None || (mode == Mode::Length && length <= 0);
-    truncated_ = false;
-    body_.clear();
-    raw_.clear();
-    pos_ = 0;
-    phase_ = ChunkPhase::Size;
-    chunkRemaining_ = 0;
-    received_ = 0;
-  }
-
-  /// 正文的落盘回调 (下载用): 设了就不再在内存里留着正文
-  using Sink = std::function<void(const char *, size_t)>;
-  void setSink(Sink sink) { sink_ = std::move(sink); }
-
-  /// 已经从网络收到并解码出来的正文字节数 (不受 maxBytes 上限影响)
-  int64_t received() const { return received_; }
-
-  void feed(const char *data, size_t size) {
-    if (done_ || size == 0) {
-      return;
-    }
-    if (mode_ == Mode::Length) {
-      const size_t take = static_cast<size_t>(
-          (std::min)(static_cast<int64_t>(size), remaining_));
-      appendBody(data, take);
-      remaining_ -= static_cast<int64_t>(take);
-      done_ = remaining_ <= 0;
-      return;
-    }
-    if (mode_ == Mode::UntilClose) {
-      appendBody(data, size);
-      return;
-    }
-    raw_.append(data, size);
-    processChunked();
-  }
-
-  /// 对端断开: 只有 UntilClose 才算正常结束
-  void finishOnClose() {
-    if (mode_ == Mode::UntilClose) {
-      done_ = true;
-    }
-  }
-
-  bool done() const { return done_; }
-  bool truncated() const { return truncated_; }
-  const std::string &body() const { return body_; }
-
-private:
-  enum class ChunkPhase { Size, Data, DataCrlf, Trailer };
-
-  void appendBody(const char *data, size_t size) {
-    if (size == 0) {
-      return;
-    }
-    received_ += static_cast<int64_t>(size);
-    if (sink_) {
-      // 流式落盘: 正文不进内存
-      sink_(data, size);
-      return;
-    }
-    const size_t room =
-        body_.size() >= static_cast<size_t>(maxBytes_)
-            ? 0
-            : static_cast<size_t>(maxBytes_) - body_.size();
-    const size_t take = (std::min)(room, size);
-    if (take > 0) {
-      body_.append(data, take);
-    }
-    if (take < size) {
-      truncated_ = true;
-    }
-  }
-
-  bool readLine(std::string &line) {
-    const size_t end = raw_.find("\r\n", pos_);
-    if (end == std::string::npos) {
-      return false;
-    }
-    line.assign(raw_, pos_, end - pos_);
-    pos_ = end + 2;
-    return true;
-  }
-
-  void processChunked() {
-    while (!done_) {
-      if (phase_ == ChunkPhase::Size) {
-        std::string line;
-        if (!readLine(line)) {
-          return;
-        }
-        const size_t semicolon = line.find(';');
-        const std::string hex{trimAscii(
-            std::string_view{line}.substr(0, semicolon))};
-        if (hex.empty()) {
-          done_ = true; ///< 坏数据: 按结束处理 (正文里已经收到的部分保留)
-          return;
-        }
-        int64_t value = 0;
-        try {
-          value = std::stoll(hex, nullptr, 16);
-        } catch (...) {
-          done_ = true;
-          return;
-        }
-        if (value <= 0) {
-          phase_ = ChunkPhase::Trailer;
-        } else {
-          chunkRemaining_ = value;
-          phase_ = ChunkPhase::Data;
-        }
-      } else if (phase_ == ChunkPhase::Data) {
-        const size_t available = raw_.size() - pos_;
-        if (available == 0) {
-          return;
-        }
-        const size_t take = static_cast<size_t>(
-            (std::min)(static_cast<int64_t>(available), chunkRemaining_));
-        appendBody(raw_.data() + pos_, take);
-        pos_ += take;
-        chunkRemaining_ -= static_cast<int64_t>(take);
-        if (chunkRemaining_ <= 0) {
-          phase_ = ChunkPhase::DataCrlf;
-        }
-      } else if (phase_ == ChunkPhase::DataCrlf) {
-        if (raw_.size() - pos_ < 2) {
-          return;
-        }
-        pos_ += 2;
-        phase_ = ChunkPhase::Size;
-      } else {
-        std::string line;
-        if (!readLine(line)) {
-          return;
-        }
-        if (line.empty()) {
-          done_ = true;
-          return;
-        }
-      }
-    }
-  }
-
-  Mode mode_ = Mode::None;
-  int64_t remaining_ = 0;
-  int64_t maxBytes_ = kMaxHttpBody;
-  int64_t received_ = 0;
-  Sink sink_;
-  bool done_ = true;
-  bool truncated_ = false;
-  std::string body_;
-  std::string raw_;
-  size_t pos_ = 0;
-  ChunkPhase phase_ = ChunkPhase::Size;
-  int64_t chunkRemaining_ = 0;
-};
-
 /* ==================== 有界等待槽 (网络线程 → 调用线程) ==================== */
 
 struct SyncSlot {
@@ -1137,7 +969,7 @@ private:
 
 namespace utilxx {
 
-struct HttpClient;
+struct HttpRequestTask;
 struct HttpServerStream;
 struct TcpStream;
 struct WsStream;
@@ -1218,7 +1050,7 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   struct HttpWait {
     std::string plugin;
     DoneFn done;
-    std::shared_ptr<HttpClient> client;
+    std::shared_ptr<HttpRequestTask> client;
   };
   std::map<int64_t, HttpWait> httpWaits;
 
@@ -2524,91 +2356,56 @@ struct TcpStream : Stream {
 
 /* ==================== HTTP 客户端 ==================== */
 
-struct HttpClient : std::enable_shared_from_this<HttpClient> {
+/// 一次 HTTP 客户端请求（`http.request` / `http.fetch` / `http.download`）
+///
+/// 协议（建连、TLS、重定向、chunked、正文上限）交给库里的 `utilxx::HttpClient`，
+/// 这里只做三件事：把插件参数换算成请求配置、把结果拼成插件面熟的 JSON、管取消与超时。
+/// 整条请求是一条协程，挂在集线器的 io_context 上。
+struct HttpRequestTask : std::enable_shared_from_this<HttpRequestTask> {
   std::shared_ptr<PluginNetHub::Impl> hub;
   std::string plugin;
   int64_t requestId = 0;
 
-  // 参数
+  // 参数（由 startHttpRequest 填好）
   std::string url;
   std::string method = "GET";
   Json headers = Json::object();
   std::string body;
   int64_t timeoutMs = kDefaultHttpTimeoutMs;
-  int64_t maxBytes = kMaxHttpBody;
+  int64_t maxBytes = 0; ///< <= 0 = 不限制（正文全读进内存）
   bool followRedirects = true;
   int32_t maxRedirects = 3;
-  TlsClientOptions tls; ///< https 时由 startHttpRequest 填好
+  TlsClientOptions tls; ///< https 时按 URL 填好（caFile / caPem / serverName 都在里面）
 
-  /// 本次调用是哪种形态 (结果 JSON 的字段不同)
+  /// 本次调用是哪种形态（结果 JSON 的字段不同）
   HttpMode mode = HttpMode::Request;
   /// fetch 的 bytes 形态才需要 bodyBase64
   bool wantBase64 = true;
 
-  /// download: 落盘位置 (由 startHttpRequest 填好) 与写入状态
+  /// download: 落盘位置（目录由 startHttpRequest 准备好）
   std::string downloadDir;
   std::string downloadFileName;
   std::string downloadPath;
-  std::FILE *downloadFile = nullptr;
-  int64_t downloadBytes = 0;
-  bool downloadWriteFailed = false;
 
   // 运行状态
-  ParsedUrl target;
-  std::unique_ptr<asio::ip::tcp::resolver> resolver;
-  std::shared_ptr<NetStream> stream;
-  std::unique_ptr<asio::steady_timer> timer;
-  std::string requestData;
-  std::vector<char> readBuf;
-  std::string pending;
-  HttpHead head;
-  bool gotHead = false;
-  HttpBodyDecoder decoder;
-  int32_t redirects = 0;
   bool finished = false;
   int64_t startedAtMs = 0;
-  int64_t contentLength = -1;
-  std::string currentUrl;
+  int64_t redirects = 0;
+  int64_t downloadBytes = 0;
+  std::shared_ptr<asio::steady_timer> timer;
+  /// 取消信号：取消与超时都靠它把库里的协程拆掉（否则请求会一直占着连接）
+  std::shared_ptr<asio::cancellation_signal> cancel;
 
   void begin() {
     finished = false;
-    gotHead = false;
-    pending.clear();
-    head = HttpHead{};
     startedAtMs = nowMs();
-    attempt();
-  }
-
-  void attempt() {
-    closeStreamAndFile();
-    if (resolver) {
-      resolver.reset();
-    }
-    // 重定向会再次进来: 上一次响应剩下的字节不能带进下一次
-    gotHead = false;
-    pending.clear();
-    head = HttpHead{};
-    contentLength = -1;
-    currentUrl = url;
-    target = parseUrl(url);
-    if (!target.ok) {
-      fail("bad_url", target.error);
-      return;
-    }
-    const bool secure = target.scheme == "https";
-    if (!secure && target.scheme != "http") {
-      fail("unsupported_scheme", "HTTP 客户端只支持 http:// 与 https://");
-      return;
-    }
-    tls.enable = secure;
-    tls.host = target.host;
-    decoder = HttpBodyDecoder{};
-    if (!timer) {
-      timer = std::make_unique<asio::steady_timer>(hub->io);
-    }
-    // `timeoutMs <= 0` = 不设超时（不排这条 timer）
+    redirects = 0;
+    downloadBytes = 0;
+    cancel = std::make_shared<asio::cancellation_signal>();
     auto self = shared_from_this();
+    // 整条请求的期限（含 DNS、建连、TLS 与读正文）：到点就让库里的协程停下来
     if (timeoutMs > 0) {
+      timer = std::make_shared<asio::steady_timer>(hub->io);
       timer->expires_after(std::chrono::milliseconds{timeoutMs});
       timer->async_wait([self](AsioErrorCode ec) {
         if (ec) {
@@ -2617,319 +2414,254 @@ struct HttpClient : std::enable_shared_from_this<HttpClient> {
         self->fail("timeout", "请求超时");
       });
     }
-    resolver = std::make_unique<asio::ip::tcp::resolver>(hub->io);
-    resolver->async_resolve(target.host, std::to_string(target.port),
-                            [self](AsioErrorCode ec,
-                                   asio::ip::tcp::resolver::results_type results) {
-                              if (ec) {
-                                self->fail("resolve_failed", errorTextOf(ec));
-                                return;
-                              }
-                              self->onResolved(std::move(results));
-                            });
+    asio::co_spawn(
+        hub->io.get_executor(), self->run(),
+        asio::bind_cancellation_slot(
+            cancel->slot(),
+            [self](std::exception_ptr error) { self->onDone(error); }));
   }
 
-  void onResolved(asio::ip::tcp::resolver::results_type results) {
-    stream = std::make_shared<NetStream>(asio::ip::tcp::socket(hub->io));
+  /// 跑完整条请求（库的协程在这里被 await；取消会作为异常穿出来）
+  asio::awaitable<void> run() {
     auto self = shared_from_this();
-    asio::async_connect(
-        stream->lowest_layer(), results,
-        [self](AsioErrorCode ec, const asio::ip::tcp::endpoint &) {
-          if (ec) {
-            self->fail("connect_failed", errorTextOf(ec));
-            return;
-          }
-          if (!self->tls.enable) {
-            self->sendRequest();
-            return;
-          }
-          // https: 先 TLS 握手, 再发请求
-          self->stream->asyncStartTls(
-              self->tls, [self](AsioErrorCode tlsEc, std::string code,
-                                std::string message) {
-                if (self->finished) {
-                  return;
-                }
-                if (tlsEc) {
-                  self->fail(code.empty() ? "tls_failed" : code, message);
-                  return;
-                }
-                self->sendRequest();
-              });
-        });
-  }
+    const ParsedUrl parsed = parseUrl(url);
+    if (!parsed.ok) {
+      fail("bad_url", parsed.error);
+      co_return;
+    }
+    if (parsed.scheme != "http" && parsed.scheme != "https") {
+      fail("unsupported_scheme", "HTTP 客户端只支持 http:// 与 https://");
+      co_return;
+    }
 
-  void sendRequest() {
-    std::string headText;
-    headText.reserve(256);
-    headText += method + " " + target.target + " HTTP/1.1\r\n";
-    bool hasHost = false;
-    bool hasContentType = false;
-    bool hasAccept = false;
+    utilxx::HeaderMap headerMap;
+    std::string contentType;
     if (headers.is_object()) {
       for (const auto &item : headers.items()) {
         const std::string name{item.first};
-        if (iequals(name, "host")) hasHost = true;
-        if (iequals(name, "content-type")) hasContentType = true;
-        if (iequals(name, "accept")) hasAccept = true;
-        // Content-Length / Connection 由这里决定, 不接受覆盖 (避免请求体错位)
+        // Content-Length / Connection / Transfer-Encoding 由库生成，写了也忽略
         if (iequals(name, "content-length") || iequals(name, "connection") ||
             iequals(name, "transfer-encoding")) {
           continue;
         }
-        headText += name + ": " + toSafeText(jsonTextOf(item.second)) + "\r\n";
+        const std::string value = toSafeText(jsonTextOf(item.second));
+        if (iequals(name, "content-type")) {
+          contentType = value;
+        }
+        headerMap.set(name, value);
       }
     }
-    if (!hasHost) {
-      headText += "Host: " + hostHeaderOf(target) + "\r\n";
+    if (!body.empty() && contentType.empty()) {
+      contentType = "application/octet-stream";
     }
-    if (!hasAccept) {
-      headText += "Accept: */*\r\n";
+
+    utilxx::RequestConfig config;
+    const auto budget = timeoutMs > 0 ? std::chrono::milliseconds{timeoutMs}
+                                      : std::chrono::hours{24 * 365};
+    config.connectTimeout = budget;
+    config.readChunkTimeout = budget;
+    config.followRedirect =
+        followRedirects ? static_cast<size_t>((std::max)(0, maxRedirects)) : 0;
+    config.keepAlive = false;
+    // 正文上限：插件给了 maxBytes 就读满停下并标 truncated，不给就整份读进内存
+    config.truncateToLimit = maxBytes > 0;
+    config.maxResponseBody = maxBytes > 0 ? static_cast<uint64_t>(maxBytes) : 0;
+    if (parsed.scheme == "https") {
+      tls.enable = true;
+      tls.host = parsed.host;
+      config.sslVerify = tls.verify;
+      config.sslVerifyHost = tls.verify;
+      config.sslServerName = tls.serverName;
+      if (!tls.caFile.empty() || !tls.caPem.empty()) {
+        std::string tlsError;
+        config.sslContext = tlsClientContext(tls, tlsError);
+        if (!config.sslContext) {
+          fail("tls_config", tlsError.empty() ? "TLS 配置不可用" : tlsError);
+          co_return;
+        }
+      }
     }
-    if (!body.empty() && !hasContentType) {
-      headText += "Content-Type: application/octet-stream\r\n";
+
+    if (mode == HttpMode::Download) {
+      downloadPath = downloadDir + "/" + downloadFileName;
+      auto result = co_await utilxx::HttpClient::downloadAsync(
+          url, downloadPath, headerMap, config,
+          [self](uint64_t received, std::optional<uint64_t> total) {
+            (void)total;
+            self->downloadBytes = static_cast<int64_t>(received);
+          });
+      if (finished) {
+        co_return;
+      }
+      if (!result) {
+        failFromLibrary(result.error());
+        co_return;
+      }
+      completeDownload(*result);
+      co_return;
     }
-    headText += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-    headText += "Connection: close\r\n";
-    headText += "\r\n";
-    requestData = headText + body;
-    if (mode == HttpMode::Download && !downloadDir.empty() &&
-        !openDownloadFile()) {
+
+    auto result = co_await utilxx::HttpClient::requestAsync(
+        method, url, body, contentType, headerMap, config);
+    if (finished) {
+      co_return;
+    }
+    if (!result) {
+      failFromLibrary(result.error());
+      co_return;
+    }
+    completeResponse(*result);
+  }
+
+  /// 协程收尾：取消 / 超时已经在 fail() 里发出结果，这里只剩真正的异常
+  void onDone(std::exception_ptr error) {
+    if (!error || finished) {
       return;
     }
-    auto self = shared_from_this();
-    asio::async_write(*stream, asio::buffer(requestData),
-                      [self](AsioErrorCode ec, size_t) {
-                        if (ec) {
-                          self->fail("write_failed", errorTextOf(ec));
-                          return;
-                        }
-                        self->readSome();
-                      });
+    std::string message = "请求失败";
+    try {
+      std::rethrow_exception(error);
+    } catch (const std::exception &e) {
+      message = e.what();
+    } catch (...) {
+    }
+    fail("read_failed", message);
   }
 
-  void readSome() {
-    readBuf.resize(kReadChunk);
-    auto self = shared_from_this();
-    stream->async_read_some(
-        asio::buffer(readBuf), [self](AsioErrorCode ec, size_t size) {
-          if (size > 0) {
-            self->onData(self->readBuf.data(), size);
-            if (self->finished) {
-              return;
-            }
-          }
-          if (ec) {
-            if (NetStream::isPeerClosed(ec)) {
-              self->onEof();
-            } else {
-              self->fail("read_failed", errorTextOf(ec));
-            }
-            return;
-          }
-          self->readSome();
-        });
-  }
-
-  void onData(const char *data, size_t size) {
-    // 先拼进 pending: 头还没读完时它就是响应头缓冲区, 头读完之后它就是尚未解析的正文。
-    // (响应可能分很多次读到 —— TLS 下尤其如此; 只拼头不拼后续数据会把后半段正文丢掉,
-    //  表现为 "连接在响应正文读完前关闭")
-    pending.append(data, size);
-    if (!gotHead) {
-      const size_t headEnd = pending.find("\r\n\r\n");
-      if (headEnd == std::string::npos) {
-        if (pending.size() > kMaxHeadBytes) {
-          fail("bad_response", "响应头过大");
-        }
-        return;
-      }
-      std::string headText = pending.substr(0, headEnd);
-      pending.erase(0, headEnd + 4);
-      if (!parseHttpHead(headText, false, head)) {
-        fail("bad_response", "响应头解析失败");
-        return;
-      }
-      gotHead = true;
-
-      // 重定向: 换地址重来 (正文不读, 直接关掉当前连接)
-      const std::string location = head.header("location");
-      const bool isRedirect = head.status == 301 || head.status == 302 ||
-                              head.status == 303 || head.status == 307 ||
-                              head.status == 308;
-      if (isRedirect && followRedirects && !location.empty() &&
-          redirects < (std::max)(0, static_cast<int>(maxRedirects))) {
-        if (head.status == 303 ||
-            (head.status == 301 || head.status == 302)) {
-          method = "GET";
-          body.clear();
-        }
-        ++redirects;
-        const std::string next = absoluteUrl(location);
-        AsioErrorCode ignored;
-        timer->cancel();
-        if (stream) {
-          stream->close();
-          stream.reset();
-        }
-        url = next;
-        attempt();
-        return;
-      }
-
-      const std::string transfer = lowerAscii(head.header("transfer-encoding"));
-      const std::string lengthText = head.header("content-length");
-      const bool noBody = method == "HEAD" || head.status == 204 ||
-                          head.status == 304;
-      // 下载: 正文直接流式写文件, 内存里不留 (只受调用方给的 maxBytes 约束)
-      const int64_t bodyLimit = maxBytes;
-      if (noBody) {
-        decoder.init(HttpBodyDecoder::Mode::None, 0, bodyLimit);
-      } else if (transfer.find("chunked") != std::string::npos) {
-        decoder.init(HttpBodyDecoder::Mode::Chunked, 0, bodyLimit);
-      } else if (!lengthText.empty()) {
-        int64_t length = 0;
-        try {
-          length = std::stoll(lengthText);
-        } catch (...) {
-          length = -1;
-        }
-        contentLength = length;
-        if (length < 0) {
-          decoder.init(HttpBodyDecoder::Mode::UntilClose, 0, bodyLimit);
-        } else {
-          decoder.init(HttpBodyDecoder::Mode::Length, length, bodyLimit);
-        }
-      } else {
-        decoder.init(HttpBodyDecoder::Mode::UntilClose, 0, bodyLimit);
-      }
-    }
-    if (!pending.empty()) {
-      decoder.feed(pending.data(), pending.size());
-      pending.clear();
-      if (downloadWriteFailed) {
-        fail("write_failed", "下载文件写入失败: " + downloadPath);
-        return;
-      }
-    }
-    if (decoder.done()) {
-      complete();
-    } else if (decoder.truncated()) {
-      complete();
-    }
-  }
-
-  void onEof() {
-    if (!gotHead) {
-      fail("bad_response", "连接在响应头读完前关闭");
-      return;
-    }
-    decoder.finishOnClose();
-    if (decoder.done() || decoder.truncated()) {
-      complete();
-    } else {
-      std::string detail = "连接在响应正文读完前关闭 (已收到 " +
-                           std::to_string(decoder.received()) + " 字节";
-      if (contentLength >= 0) {
-        detail += " / 声明 " + std::to_string(contentLength);
-      }
-      detail += ")";
-      fail("incomplete", detail);
-    }
-  }
-
-  void complete() {
+  void completeResponse(const utilxx::HttpResponse &response) {
     if (finished) {
       return;
     }
     finished = true;
-    if (timer) {
-      timer->cancel();
-    }
-    closeStreamAndFile();
+    stopTimer();
+    redirects = static_cast<int64_t>(response.redirects);
+    const int64_t bodyBytes = static_cast<int64_t>(response.body.size());
     Json out = Json::object();
     out["ok"] = true;
-    out["url"] = currentUrl;
-    out["status"] = head.status;
-    out["statusText"] = head.reason;
-    out["headers"] = head.headersJson();
-    out["contentType"] = head.header("content-type");
-    out["contentLength"] = contentLength;
-    out["receivedBytes"] = decoder.received();
-    out["truncated"] = decoder.truncated();
+    out["url"] = url;
+    out["status"] = response.status;
+    out["statusText"] = statusTextOf(response.status);
+    out["headers"] = headersJsonOf(response.headers);
+    out["contentType"] = std::string{response.findHeader("content-type")};
+    out["contentLength"] = contentLengthOf(response.headers);
+    out["receivedBytes"] = bodyBytes;
+    out["truncated"] = response.truncated;
     out["redirects"] = redirects;
     out["elapsedMs"] = nowMs() - startedAtMs;
-    if (mode == HttpMode::Download) {
-      out["path"] = downloadPath;
-      out["bytes"] = downloadBytes;
-    } else {
-      const std::string &bodyText = decoder.body();
-      out["bodyBytes"] = static_cast<int64_t>(bodyText.size());
-      if (wantBase64) {
-        out["bodyBase64"] = utilxx_base::base64Encode(bodyText);
-      }
-      if (isValidUtf8(bodyText)) {
-        out["body"] = bodyText;
-      }
+    out["bodyBytes"] = bodyBytes;
+    if (wantBase64) {
+      out["bodyBase64"] = utilxx_base::base64Encode(response.body);
+    }
+    if (isValidUtf8(response.body)) {
+      out["body"] = response.body;
     }
     hub->finishHttpRequest(requestId, true, std::move(out));
   }
 
+  void completeDownload(const utilxx::DownloadResult &result) {
+    if (finished) {
+      return;
+    }
+    finished = true;
+    stopTimer();
+    downloadBytes = static_cast<int64_t>(result.bytes);
+    Json out = Json::object();
+    out["ok"] = true;
+    out["url"] = url;
+    out["status"] = result.status;
+    out["statusText"] = statusTextOf(result.status);
+    out["headers"] = headersJsonOf(result.headers);
+    out["contentType"] = std::string{result.headers.getSingle("content-type")};
+    out["contentLength"] = contentLengthOf(result.headers);
+    out["receivedBytes"] = downloadBytes;
+    out["truncated"] = false;
+    out["redirects"] = redirects;
+    out["elapsedMs"] = nowMs() - startedAtMs;
+    out["path"] = downloadPath;
+    out["bytes"] = downloadBytes;
+    hub->finishHttpRequest(requestId, true, std::move(out));
+  }
+
+  /// 收尾成一条失败结果（失败 / 超时 / 取消都走这里）
   void fail(std::string_view code, std::string_view message) {
     if (finished) {
       return;
     }
     finished = true;
-    if (timer) {
-      timer->cancel();
+    stopTimer();
+    // 把库里的协程拆掉（连接随请求一起关）
+    if (cancel) {
+      cancel->emit(asio::cancellation_type::terminal);
     }
-    closeStreamAndFile();
     Json out = errorJson(code, message);
-    out["url"] = currentUrl;
+    out["url"] = url;
     out["redirects"] = redirects;
     out["elapsedMs"] = nowMs() - startedAtMs;
     hub->finishHttpRequest(requestId, false, std::move(out));
   }
 
-  /// 关连接; 退出时把下载文件也收尾 (失败时把半份文件删掉)
-  void closeStreamAndFile() {
-    if (stream) {
-      stream->close();
-      stream.reset();
+  /// 库只给错误串，这里按其中的关键字还原成插件面熟的错误码
+  void failFromLibrary(const std::string &message) {
+    const std::string lower = lowerAscii(message);
+    const auto has = [&lower](std::string_view needle) {
+      return lower.find(needle) != std::string::npos;
+    };
+    std::string_view code = "read_failed";
+    if (has("invalid url")) {
+      code = "bad_url";
+    } else if (has("cannot open file") || has("write file") || has("no such file")) {
+      code = "write_failed";
+    } else if (has("resolve") || has("host not found") || has("name or service")) {
+      code = "resolve_failed";
+    } else if (has("certificate") || has("cert ") || has("verify failed")) {
+      code = "tls_cert_invalid";
+    } else if (has("ssl") || has("tls") || has("handshake")) {
+      code = "tls_handshake_failed";
+    } else if (has("connect") || has("refused") || has("unreachable")) {
+      code = "connect_failed";
+    } else if (has("truncated") || has("partial")) {
+      code = "incomplete";
+    } else if (has("timeout") || has("timed out")) {
+      code = "timeout";
     }
-    if (downloadFile) {
-      std::fclose(downloadFile);
-      downloadFile = nullptr;
-      if (finished && downloadBytes == 0 && !downloadPath.empty()) {
-        // 一个字节都没写下来就不要留空文件
-        std::remove(downloadPath.c_str());
-        downloadPath.clear();
-      }
-    }
+    fail(code, message);
   }
 
-  /// 创建下载文件并给它接上写入回调 (目录由 startHttpRequest 准备好)
-  bool openDownloadFile() {
-    downloadPath = downloadDir + "/" + downloadFileName;
-    downloadFile = std::fopen(downloadPath.c_str(), "wb");
-    if (!downloadFile) {
-      downloadPath.clear();
-      fail("write_failed", "下载文件建不出来: " + downloadDir + "/" + downloadFileName);
-      return false;
+  void stopTimer() {
+    if (!timer) {
+      return;
     }
-    downloadBytes = 0;
-    downloadWriteFailed = false;
-    decoder.setSink([this](const char *data, size_t size) {
-      if (!downloadFile || downloadWriteFailed) {
-        return;
+    AsioErrorCode ignored;
+    timer->cancel();
+  }
+
+  static Json headersJsonOf(const utilxx::HeaderMap &map) {
+    Json out = Json::object();
+    for (const auto &item : map.data) {
+      // 重复头（Set-Cookie 等）用换行拼起来，与旧实现一致
+      std::string joined;
+      for (const auto &value : item.second) {
+        if (!joined.empty()) {
+          joined += '\n';
+        }
+        joined += toSafeText(value);
       }
-      if (std::fwrite(data, 1, size, downloadFile) != size) {
-        downloadWriteFailed = true;
-        return;
-      }
-      downloadBytes += static_cast<int64_t>(size);
-    });
-    return true;
+      out[lowerAscii(toSafeText(item.first))] = joined;
+    }
+    return out;
+  }
+
+  static int64_t contentLengthOf(const utilxx::HeaderMap &map) {
+    const std::string_view text = map.getSingle("content-length");
+    if (text.empty()) {
+      return -1;
+    }
+    int64_t value = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || value < 0) {
+      return -1;
+    }
+    return value;
   }
 
   static int64_t nowMs() {
@@ -2937,25 +2669,6 @@ struct HttpClient : std::enable_shared_from_this<HttpClient> {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
-  }
-
-  /// 相对 Location → 绝对地址 (同协议; 保留原来是哪种 scheme)
-  std::string absoluteUrl(const std::string &location) const {
-    if (location.find("://") != std::string::npos) {
-      return location;
-    }
-    const std::string origin = originOf(target);
-    if (!location.empty() && location.front() == '/') {
-      return origin + location;
-    }
-    std::string base = target.path;
-    const size_t slash = base.find_last_of('/');
-    if (slash != std::string::npos) {
-      base = base.substr(0, slash + 1);
-    } else {
-      base = "/";
-    }
-    return origin + base + location;
   }
 };
 
@@ -2985,7 +2698,7 @@ bool PluginNetHub::Impl::startHttpRequest(const std::string &plugin,
     return false;
   }
 
-  auto client = std::make_shared<HttpClient>();
+  auto client = std::make_shared<HttpRequestTask>();
   client->hub = shared_from_this();
   client->plugin = plugin;
   client->requestId = requestId;

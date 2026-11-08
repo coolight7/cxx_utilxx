@@ -33,6 +33,14 @@ struct TlsClientOptions {
   std::string caPem;    ///< 额外信任的 CA 内容 (PEM)
 };
 
+/// 按参数取一个 TLS 上下文（内部按 是否校验 + 额外 CA 缓存）
+///
+/// 给库里的 HTTP / WebSocket 客户端复用插件网络的 TLS 选项: 自签名 CA 与 SNI 覆盖要能
+/// 带进库的请求里（`RequestConfig::sslContext` 就是这样拿到的）。失败时填 `error`
+/// 并返回 nullptr。
+std::shared_ptr<asio::ssl::context>
+    tlsClientContext(const TlsClientOptions &options, std::string &error);
+
 /// 一条连接的读写层
 ///
 /// - 默认是纯 TCP; `asyncStartTls` 成功后读写都走 TLS, 上层代码不用区分;

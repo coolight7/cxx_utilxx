@@ -40,6 +40,13 @@ struct UTILXX_API HttpResponse {
     /// - 连接池据此决定响应完成后连接是否可归还复用
     bool keepAlive = false;
 
+    /// 正文读到上限就停了（`RequestConfig::truncateToLimit` 为真时才会出现）：
+    /// `body` 是已经读到的部分，不是完整响应
+    bool truncated = false;
+
+    /// 本次响应之前跟了几次重定向（0 = 没重定向）
+    size_t redirects = 0;
+
     std::string_view findHeader(std::string_view name) const noexcept;
 
     bool isSuccess() const noexcept;
@@ -98,6 +105,22 @@ struct RequestConfig {
     bool                                     keepAlive                = false;
     size_t                                   maxConcurrentConnections = 5;
     uint64_t                                 maxResponseBody          = kDefaultMaxResponseBody;
+
+    /// 正文读满 `maxResponseBody` 就停下（默认 false = 超限按失败处理）
+    ///
+    /// 为真时响应里的 `truncated` 为 true，`body` 是已读到的前面一段。
+    bool truncateToLimit = false;
+
+    /// 本次请求专用的 TLS 上下文（为空 = 用进程共享的那两个）
+    ///
+    /// 用处：插件网络要把“额外信任的 CA”传进来，而共享上下文不能按请求改。
+    std::shared_ptr<asio::ssl::context> sslContext;
+
+    /// 是否校验主机名（证书里的 DNS 名 / IP SAN）；默认关闭（沿用库以前的只校链行为）
+    bool sslVerifyHost = false;
+
+    /// 覆盖 SNI 与主机名校验用的名字（为空 = 用 URL 里的主机名）
+    std::string sslServerName;
 };
 
 class UTILXX_API HttpClient {
@@ -186,12 +209,15 @@ public:
 
         boost::beast::flat_buffer                buffer;
         http::response_parser<http::string_body> parser;
-        parser.body_limit(config.maxResponseBody);
+        if (config.maxResponseBody > 0) {
+            parser.body_limit(config.maxResponseBody);
+        }
         // HEAD 响应按 RFC 7231 §4.3.2 只返回头部、不携带 body (但 Content-Length 保留),
         // 解析器不知道请求方法, 必须显式 skip, 否则会一直等待永远不会到达的 body 直到超时
         if (req.method() == http::verb::head) {
             parser.skip(true);
         }
+        bool truncated = false;
         // 连接关闭但响应未解析完整时, async_read_some 会抛出 eof 错误 (由调用方捕获),
         // 不会返回截断的 body
         while (!parser.is_done()) {
@@ -203,6 +229,11 @@ public:
                     asio::cancel_after(config.readChunkTimeout, asio::use_awaitable)
                 );
             } catch (const utilxx_base::AsioSystemError& e) {
+                // 调用方给了正文上限并且允许截断: 读满就停, 已读到的部分就是结果
+                if (config.truncateToLimit && e.code() == http::error::body_limit) {
+                    truncated = true;
+                    break;
+                }
                 // 服务器在响应完整发送前关闭了连接 (Content-Length 偏大 / chunked
                 // 编码不完整 / 网关超时掐断), beast 报 partial_message。原始错误信息
                 // 只含 "partial message [beast.http:2 ...]" 无任何请求上下文, 甚至
@@ -235,6 +266,7 @@ public:
             resp.headers.set(field.name_string(), field.value());
         }
         resp.body = std::move(res.body());
+        resp.truncated = truncated;
         co_return std::expected<HttpResponse, std::string>{std::move(resp)};
     }
 
