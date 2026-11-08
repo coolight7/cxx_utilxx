@@ -80,6 +80,8 @@ set(_CXX_UTILXX_SOURCES
   src/plugin_net_hub.cpp
   src/plugin_net_hub_tls.cpp
   src/regex.cpp
+  src/tcp.cpp
+  src/udp.cpp
   src/ws_client.cpp
 )
 
