@@ -91,6 +91,46 @@ asio::ip::address resolveBindAddress(const std::string& address) {
     return results.begin()->endpoint().address();
 }
 
+/// 按扩展名猜 Content-Type (只看最后一段扩展名, 大小写不敏感)
+///
+/// 只收录本库实际会遇到的常见类型; 猜不到给空串 (调用方回 octet-stream)。
+std::string_view guessContentType(std::string_view filePath) {
+    const auto dot = filePath.rfind('.');
+    if (dot == std::string_view::npos) {
+        return {};
+    }
+    auto ext = filePath.substr(dot + 1);
+    std::string lower;
+    lower.reserve(ext.size());
+    for (const char ch : ext) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    if (lower == "mp3") return "audio/mpeg";
+    if (lower == "flac") return "audio/flac";
+    if (lower == "m4a" || lower == "mp4") return "audio/mp4";
+    if (lower == "aac") return "audio/aac";
+    if (lower == "wav") return "audio/wav";
+    if (lower == "ogg" || lower == "opus") return "audio/ogg";
+    if (lower == "webm") return "video/webm";
+    if (lower == "mkv") return "video/x-matroska";
+    if (lower == "ts") return "video/mp2t";
+    if (lower == "m3u8") return "application/vnd.apple.mpegurl";
+    if (lower == "jpg" || lower == "jpeg") return "image/jpeg";
+    if (lower == "png") return "image/png";
+    if (lower == "gif") return "image/gif";
+    if (lower == "webp") return "image/webp";
+    if (lower == "svg") return "image/svg+xml";
+    if (lower == "json") return "application/json";
+    if (lower == "html" || lower == "htm") return "text/html; charset=utf-8";
+    if (lower == "css") return "text/css; charset=utf-8";
+    if (lower == "js") return "text/javascript; charset=utf-8";
+    if (lower == "md") return "text/markdown; charset=utf-8";
+    if (lower == "txt" || lower == "lrc" || lower == "srt" || lower == "ass") {
+        return "text/plain; charset=utf-8";
+    }
+    return {};
+}
+
 } // namespace
 
 HttpServer::HttpServer(Config config) :
@@ -211,6 +251,31 @@ void HttpServer::addSsePostRoute(
 
 void HttpServer::enableWebSocket(std::string_view path, WsHandler handler) {
     wsRoutes_[std::string{path}] = std::move(handler);
+}
+
+void HttpServer::enableFileRoute(
+    std::string_view path,
+    std::string_view filePath,
+    std::string_view contentType
+) {
+    FileRouteEntry entry;
+    entry.path        = std::string{path};
+    entry.filePath    = std::string{filePath};
+    entry.contentType = contentType.empty()
+                            ? std::string{guessContentType(filePath)}
+                            : std::string{contentType};
+    // 同一路径重复注册: 后来的覆盖前面的 (与 wsRoutes_ 的行为一致)
+    for (auto& existing : fileRoutes_) {
+        if (existing.path == entry.path) {
+            existing = std::move(entry);
+            return;
+        }
+    }
+    fileRoutes_.push_back(std::move(entry));
+}
+
+void HttpServer::clearFileRoutes() {
+    fileRoutes_.clear();
 }
 
 void HttpServer::startAsync(asio::any_io_executor executor) {
