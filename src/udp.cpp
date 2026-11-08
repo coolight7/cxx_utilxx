@@ -46,15 +46,24 @@ asio::awaitable<std::expected<std::unique_ptr<UdpSocket>, std::string>> UdpSocke
     asio::any_io_executor executor,
     UdpConfig             config
 ) {
+    // 建 socket / 设选项 / bind 都是同步操作, 与同步形态共用一份实现
+    co_return UdpSocket::openSync(std::move(executor), std::move(config));
+}
+
+std::expected<std::unique_ptr<UdpSocket>, std::string> UdpSocket::openSync(
+    asio::any_io_executor executor,
+    UdpConfig             config
+) {
     AsioErrorCode ec;
     auto          address = asio::ip::make_address(config.address, ec);
     if (ec) {
-        co_return std::unexpected("invalid bind address: " + ec.message());
+        return std::unexpected("invalid bind address: " + ec.message());
     }
     asio::ip::udp::socket socket(executor);
-    socket.open(asio::ip::udp::v4(), ec);
+    const auto            protocol = address.is_v6() ? asio::ip::udp::v6() : asio::ip::udp::v4();
+    socket.open(protocol, ec);
     if (ec) {
-        co_return std::unexpected(ec.message());
+        return std::unexpected(ec.message());
     }
     if (config.reuseAddress) {
         socket.set_option(asio::socket_base::reuse_address(true), ec);
@@ -66,10 +75,10 @@ asio::awaitable<std::expected<std::unique_ptr<UdpSocket>, std::string>> UdpSocke
     if (ec) {
         AsioErrorCode ignored;
         socket.close(ignored);
-        co_return std::unexpected(ec.message());
+        return std::unexpected(ec.message());
     }
     auto impl = std::make_shared<Impl>(std::move(socket), std::move(config));
-    co_return std::unique_ptr<UdpSocket>(new UdpSocket(std::move(impl)));
+    return std::unique_ptr<UdpSocket>(new UdpSocket(std::move(impl)));
 }
 
 asio::awaitable<std::expected<void, std::string>>
@@ -124,6 +133,42 @@ asio::awaitable<std::expected<void, std::string>>
     }
     impl->sent.fetch_add(1, std::memory_order_relaxed);
     co_return std::expected<void, std::string>{};
+}
+
+std::expected<void, std::string>
+    UdpSocket::sendToSync(std::string_view data, std::string_view host, uint16_t port) {
+    auto impl = impl_;
+    if (!impl || impl->closed.load(std::memory_order_acquire) || !impl->socket.is_open()) {
+        return std::unexpected(std::string{"socket closed"});
+    }
+    if (host.empty() || port == 0) {
+        return std::unexpected(std::string{"invalid endpoint"});
+    }
+    AsioErrorCode           ec;
+    asio::ip::udp::endpoint endpoint;
+    const auto              target = asio::ip::make_address(host, ec);
+    if (ec) {
+        // 不是 IP 字面量: 同步解析 (调用方本来就是"一次调用等一个结果")
+        asio::ip::udp::resolver resolver(impl->socket.get_executor());
+        const auto results = resolver.resolve(
+            asio::ip::udp::v4(),
+            std::string{host},
+            std::to_string(port),
+            ec
+        );
+        if (ec || results.empty()) {
+            return std::unexpected(ec ? ec.message() : std::string{"resolve failed"});
+        }
+        endpoint = results.begin()->endpoint();
+    } else {
+        endpoint = asio::ip::udp::endpoint(target, port);
+    }
+    impl->socket.send_to(asio::buffer(data.data(), data.size()), endpoint, 0, ec);
+    if (ec) {
+        return std::unexpected(ec.message());
+    }
+    impl->sent.fetch_add(1, std::memory_order_relaxed);
+    return std::expected<void, std::string>{};
 }
 
 asio::awaitable<std::expected<UdpDatagram, std::string>> UdpSocket::recv() {

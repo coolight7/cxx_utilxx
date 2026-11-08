@@ -76,9 +76,22 @@ public:
     static asio::awaitable<std::expected<std::unique_ptr<UdpSocket>, std::string>>
         open(asio::any_io_executor executor, UdpConfig config = {});
 
+    /// 同步打开并绑定一个通道（socket / setsockopt / bind 都在调用线程上完成）
+    ///
+    /// 给“一次调用等一个结果”的同步接口用（插件 op 分发就是这样），不必为了建一个
+    /// socket 起一条协程。绑定的地址族按 `config.address` 选（IPv4 或 IPv6）。
+    static std::expected<std::unique_ptr<UdpSocket>, std::string>
+        openSync(asio::any_io_executor executor, UdpConfig config = {});
+
     /// 发一个数据报（`host` 可以是域名或 IP 字面量）
     asio::awaitable<std::expected<void, std::string>>
         sendTo(std::string_view data, std::string_view host, uint16_t port);
+
+    /// 同步发一个数据报（域名解析与发送都在调用线程上完成，不设超时）
+    ///
+    /// 与 `openSync` 配套，给同步接口用；阻塞时长取决于系统解析与发送。
+    std::expected<void, std::string>
+        sendToSync(std::string_view data, std::string_view host, uint16_t port);
 
     /// 收一个数据报；没有数据时挂起等待
     asio::awaitable<std::expected<UdpDatagram, std::string>> recv();

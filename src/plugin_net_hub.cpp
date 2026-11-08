@@ -14,6 +14,8 @@
 
 #include "utilxx/plugin_net_hub_tls.h"
 
+#include "utilxx/udp.h"
+
 
 #include "utilxx_base/asio_error.h"
 #include "utilxx_base/json.h"
@@ -22,6 +24,7 @@
 
 #include <asio/buffer.hpp>
 #include <asio/connect.hpp>
+#include <asio/co_spawn.hpp>
 #include <asio/error.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/address.hpp>
@@ -119,8 +122,6 @@ constexpr int32_t kMaxServersPerKind = 8;
 constexpr size_t kMaxConnectionsPerPlugin = 64;
 /// 每个插件最多几个 UDP 通道 (每个通道一个 socket, 防止把进程 fd 用完)
 constexpr size_t kMaxUdpChannelsPerPlugin = 32;
-/// UDP 单包接收缓冲 (UDP 最大载荷 65507, 多留一点)
-constexpr size_t kUdpReadBuffer = 65536;
 /// 每个插件同时进行的 HTTP 客户端请求
 constexpr size_t kMaxHttpClientsPerPlugin = 16;
 /// 每个 HTTP 服务同时等待插件回答的请求
@@ -3821,9 +3822,8 @@ struct UdpChannel : std::enable_shared_from_this<UdpChannel> {
   std::string id;
   std::string host; ///< 绑定地址
   uint16_t port = 0; ///< 绑定端口（0 = 系统分配, 绑定后回填实际端口）
-  std::shared_ptr<asio::ip::udp::socket> socket;
-  std::vector<char> readBuf;
-  asio::ip::udp::endpoint sender; ///< 最近一个包的来源（一次只有一条读在飞）
+  /// 底层 socket 交给库（`utilxx::UdpSocket`）: 这里只管记账与事件
+  std::unique_ptr<utilxx::UdpSocket> socket;
   std::set<std::string> groups;   ///< 已加入的组播组地址
   bool reading = false;
   bool closing = false;
@@ -3833,50 +3833,67 @@ struct UdpChannel : std::enable_shared_from_this<UdpChannel> {
   int64_t sentBytes = 0;
 
   void startRead();
-  void onRead(AsioErrorCode ec, size_t size);
+  asio::awaitable<void> readLoop();
 };
 
 void UdpChannel::startRead() {
-  if (closing || reading || !socket || !socket->is_open()) {
+  if (closing || reading || !socket || !socket->isOpen()) {
     return;
-  }
-  if (readBuf.size() != kUdpReadBuffer) {
-    readBuf.resize(kUdpReadBuffer);
   }
   reading = true;
   auto self = shared_from_this();
-  socket->async_receive_from(
-      asio::buffer(readBuf), sender,
-      [self](AsioErrorCode ec, size_t size) {
+  asio::co_spawn(
+      hub->io, self->readLoop(), [self](std::exception_ptr ep) {
         self->reading = false;
-        self->onRead(ec, size);
+        if (!ep) {
+          return;
+        }
+        try {
+          std::rethrow_exception(ep);
+        } catch (const std::exception &e) {
+          XX_LOGW("[utilxx] 插件 `{}` 的 UDP 通道 `{}` 收包循环退出: {}",
+                  self->plugin, self->id, e.what());
+        } catch (...) {
+          XX_LOGW("[utilxx] 插件 `{}` 的 UDP 通道 `{}` 收包循环异常退出",
+                  self->plugin, self->id);
+        }
       });
 }
 
-void UdpChannel::onRead(AsioErrorCode ec, size_t size) {
-  if (closing) {
-    return;
-  }
-  if (ec) {
-    // 收包出错不关通道: 继续收（最常见的是 Windows 上对方端口不可达的 ICMP 回执）
-    if (ec == asio::error::operation_aborted) {
-      return;
+asio::awaitable<void> UdpChannel::readLoop() {
+  auto self = shared_from_this();
+  int  failures = 0;
+  while (!closing && socket && socket->isOpen()) {
+    auto got = co_await socket->recv();
+    if (closing) {
+      co_return;
     }
-    XX_LOGW("[utilxx] 插件 `{}` 的 UDP 通道 `{}` 收包失败: {}", plugin,
-            id, errorTextOf(ec));
-    startRead();
-    return;
-  }
-  ++recvPackets;
-  recvBytes += static_cast<int64_t>(size);
-  if (hub) {
+    if (!got) {
+      // 收包出错不关通道: 继续收（最常见的是 Windows 上对方端口不可达的 ICMP 回执）
+      if (!socket->isOpen()) {
+        co_return;
+      }
+      if (++failures >= 8) {
+        XX_LOGW("[utilxx] 插件 `{}` 的 UDP 通道 `{}` 连续收包失败: {}", plugin,
+                id, got.error());
+        co_return;
+      }
+      continue;
+    }
+    failures = 0;
+    const std::string &payload = got->data;
+    ++recvPackets;
+    recvBytes += static_cast<int64_t>(payload.size());
+    if (!hub) {
+      continue;
+    }
     Json event;
     event["kind"] = "udp.message";
     event["id"] = id;
-    event["host"] = sender.address().to_string();
-    event["port"] = static_cast<int64_t>(sender.port());
-    event["bytes"] = static_cast<int64_t>(size);
-    const std::string_view view{readBuf.data(), size};
+    event["host"] = got->fromAddress;
+    event["port"] = static_cast<int64_t>(got->fromPort);
+    event["bytes"] = static_cast<int64_t>(payload.size());
+    const std::string_view view{payload};
     event["dataBase64"] = utilxx_base::base64Encode(view);
     if (isValidUtf8(view)) {
       event["text"] = std::string{view};
@@ -3884,7 +3901,6 @@ void UdpChannel::onRead(AsioErrorCode ec, size_t size) {
     }
     hub->emit(plugin, std::move(event));
   }
-  startRead();
 }
 
 /* ==================== UDP: 操作实现 ==================== */
@@ -3898,8 +3914,7 @@ void closeUnannouncedUdp(const std::shared_ptr<UdpChannel> &channel) {
   }
   channel->closing = true;
   if (channel->socket) {
-    AsioErrorCode ignored;
-    channel->socket->close(ignored);
+    channel->socket->abort();
   }
 }
 
@@ -3912,8 +3927,7 @@ void PluginNetHub::Impl::shutdownUdp(
   }
   channel->closing = true;
   if (channel->socket) {
-    AsioErrorCode ignored;
-    channel->socket->close(ignored);
+    channel->socket->abort();
   }
   Json event;
   event["kind"] = "udp.closed";
@@ -3992,39 +4006,22 @@ bool PluginNetHub::Impl::openUdp(const std::string &plugin, const Json &args,
   channel->id = id;
   channel->host = address.to_string();
   channel->port = static_cast<uint16_t>(rawPort);
-  channel->socket = std::make_shared<asio::ip::udp::socket>(io);
-  auto &sock = *channel->socket;
-  sock.open(address.is_v6() ? asio::ip::udp::v6() : asio::ip::udp::v4(), ec);
-  if (ec) {
-    out = errorJson("open_failed", "创建 UDP socket 失败: " + errorTextOf(ec));
-    return false;
-  }
-  // 广播: 建通道时就开, 这样插件不必先"声明要广播"才能发给 255.255.255.255
-  {
-    AsioErrorCode optEc;
-    sock.set_option(asio::socket_base::broadcast(true), optEc);
-  }
-  // 组播 / 多实例监听同一端口需要地址重用（缺省开; 插件可以写 reuseAddress: false 关掉）
-  if (args.value("reuseAddress", true)) {
-    AsioErrorCode optEc;
-    sock.set_option(asio::socket_base::reuse_address(true), optEc);
-  }
-  sock.bind(asio::ip::udp::endpoint(address, channel->port), ec);
-  if (ec) {
-    AsioErrorCode ignored;
-    sock.close(ignored);
-    out = errorJson("bind_failed", "绑定 " + host + ":" +
+  utilxx::UdpConfig socketConfig;
+  socketConfig.address = channel->host;
+  socketConfig.port = channel->port;
+  // 广播: 建通道时就开, 这样插件不必先"声明要广播"才能发给 255.255.255.255; 地址重用
+  // （组播 / 多实例监听同一端口要用）缺省开, 插件可以写 reuseAddress: false 关掉
+  socketConfig.broadcast = true;
+  socketConfig.reuseAddress = args.value("reuseAddress", true);
+  auto opened = utilxx::UdpSocket::openSync(io.get_executor(), socketConfig);
+  if (!opened) {
+    out = errorJson("bind_failed", "绑定 " + channel->host + ":" +
                                        std::to_string(channel->port) +
-                                       " 失败: " + errorTextOf(ec));
+                                       " 失败: " + opened.error());
     return false;
   }
-  {
-    AsioErrorCode localEc;
-    const auto local = sock.local_endpoint(localEc);
-    if (!localEc) {
-      channel->port = local.port();
-    }
-  }
+  channel->socket = std::move(*opened);
+  channel->port = channel->socket->info().port;
 
   // 建通道时一次声明的组播组: 字符串或数组都认（`multicast` / `groups` 两种写法）
   std::vector<std::string> groups;
@@ -4042,16 +4039,16 @@ bool PluginNetHub::Impl::openUdp(const std::string &plugin, const Json &args,
   for (const auto &group : groups) {
     AsioErrorCode joinEc;
     const auto groupAddress = asio::ip::make_address(trimAscii(group), joinEc);
-    if (joinEc || !groupAddress.is_multicast()) {
+    if (joinEc || !groupAddress.is_multicast() || !groupAddress.is_v4()) {
       closeUnannouncedUdp(channel);
-      out = errorJson("bad_group", "不是合法的组播地址: " + group);
+      out = errorJson("bad_group", "不是合法的组播地址 (只支持 IPv4 组播): " + group);
       return false;
     }
-    sock.set_option(asio::ip::multicast::join_group(groupAddress), joinEc);
-    if (joinEc) {
+    const auto joined = channel->socket->joinMulticast(groupAddress.to_string());
+    if (!joined) {
       closeUnannouncedUdp(channel);
       out = errorJson("join_failed",
-                      "加入组播组 " + group + " 失败: " + errorTextOf(joinEc));
+                      "加入组播组 " + group + " 失败: " + joined.error());
       return false;
     }
     channel->groups.insert(groupAddress.to_string());
@@ -4095,28 +4092,25 @@ bool PluginNetHub::Impl::groupUdp(const std::string &plugin, const Json &args,
                                                     std::string{})))};
   AsioErrorCode ec;
   const auto groupAddress = asio::ip::make_address(raw, ec);
-  if (ec || !groupAddress.is_multicast()) {
-    out = errorJson("bad_group", "不是合法的组播地址: " + raw);
+  if (ec || !groupAddress.is_multicast() || !groupAddress.is_v4()) {
+    out = errorJson("bad_group", "不是合法的组播地址 (只支持 IPv4 组播): " + raw);
     return false;
   }
-  if (join) {
-    channel->socket->set_option(asio::ip::multicast::join_group(groupAddress),
-                               ec);
-    if (!ec) {
+  const auto applied = join
+                           ? channel->socket->joinMulticast(groupAddress.to_string())
+                           : channel->socket->leaveMulticast(groupAddress.to_string());
+  if (applied) {
+    if (join) {
       channel->groups.insert(groupAddress.to_string());
-    }
-  } else {
-    channel->socket->set_option(asio::ip::multicast::leave_group(groupAddress),
-                               ec);
-    if (!ec) {
+    } else {
       channel->groups.erase(groupAddress.to_string());
     }
   }
   out = Json::object();
-  if (ec) {
+  if (!applied) {
     out["ok"] = false;
     out["error"] = join ? "join_failed" : "leave_failed";
-    out["message"] = errorTextOf(ec);
+    out["message"] = applied.error();
     return false;
   }
   out["ok"] = true;
@@ -4183,41 +4177,27 @@ void PluginNetHub::Impl::sendUdp(const std::string &plugin, const Json &args,
     return;
   }
 
-  asio::ip::udp::endpoint target;
-  AsioErrorCode ec;
-  const auto address = asio::ip::make_address(host, ec);
-  if (!ec) {
-    target = asio::ip::udp::endpoint(address, static_cast<uint16_t>(rawPort));
-  } else {
-    // 主机名：同步解析（只在网络线程上、而且这一次调用本来就在等结果）
-    asio::ip::udp::resolver resolver(io);
-    AsioErrorCode resolveEc;
-    const auto results = resolver.resolve(host, std::to_string(rawPort),
-                                         resolveEc);
-    if (resolveEc || results.empty()) {
-      out = errorJson("resolve_failed",
-                      "解析目标地址失败: " + host +
-                          (resolveEc ? (" (" + errorTextOf(resolveEc) + ")") : ""));
-      return;
-    }
-    target = results.begin()->endpoint();
-  }
-
-  AsioErrorCode sendEc;
-  const size_t sent = channel->socket->send_to(asio::buffer(payload), target,
-                                              0, sendEc);
-  if (sendEc) {
-    out = errorJson("send_failed", "发送失败: " + errorTextOf(sendEc));
+  // 发送与域名解析都交给库（同步形态：这次调用本来就在等结果）
+  const auto sent = channel->socket->sendToSync(
+      payload, host, static_cast<uint16_t>(rawPort));
+  if (!sent) {
+    const std::string &reason = sent.error();
+    const bool looksResolve = reason.find("resolve") != std::string::npos ||
+                              reason.find("Host not found") != std::string::npos ||
+                              reason.find("Name or service") != std::string::npos;
+    out = errorJson(looksResolve ? "resolve_failed" : "send_failed",
+                    (looksResolve ? "解析目标地址失败: " : "发送失败: ") +
+                        host + " (" + reason + ")");
     return;
   }
   ++channel->sentPackets;
-  channel->sentBytes += static_cast<int64_t>(sent);
+  channel->sentBytes += static_cast<int64_t>(payload.size());
   out = Json::object();
   out["ok"] = true;
   out["id"] = channel->id;
-  out["host"] = target.address().to_string();
-  out["port"] = static_cast<int64_t>(target.port());
-  out["bytes"] = static_cast<int64_t>(sent);
+  out["host"] = host;
+  out["port"] = static_cast<int64_t>(rawPort);
+  out["bytes"] = static_cast<int64_t>(payload.size());
 }
 
 void PluginNetHub::Impl::closeUdp(const std::string &plugin,
