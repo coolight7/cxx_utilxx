@@ -278,6 +278,14 @@ void HttpServer::clearFileRoutes() {
     fileRoutes_.clear();
 }
 
+void HttpServer::setFallbackHandler(FallbackHandler handler) {
+    if (!handler) {
+        fallback_.reset();
+        return;
+    }
+    fallback_ = std::make_shared<FallbackHandler>(std::move(handler));
+}
+
 void HttpServer::startAsync(asio::any_io_executor executor) {
     if (stopped_) {
         return;

@@ -15,6 +15,7 @@
 #include "utilxx/plugin_net_hub_tls.h"
 
 #include "utilxx/http_client.h"
+#include "utilxx/http_server.h"
 #include "utilxx/udp.h"
 
 
@@ -36,7 +37,9 @@
 #include <asio/ip/udp.hpp>
 #include <asio/post.hpp>
 #include <asio/read.hpp>
+#include <asio/redirect_error.hpp>
 #include <asio/steady_timer.hpp>
+#include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
 
 #include <algorithm>
@@ -112,8 +115,6 @@ constexpr int64_t kMaxHttpBody = 8 * 1024 * 1024;
 constexpr int64_t kMaxWsMessage = 8 * 1024 * 1024;
 /// 单条连接的发送队列上限 (背压)
 constexpr size_t kMaxOutQueue = 4 * 1024 * 1024;
-/// 静态内容 (文件 / 内存) 一次发多少字节
-constexpr size_t kStaticChunk = 64 * 1024;
 /// 单个 HTTP 服务最多登记几条静态路由
 constexpr size_t kMaxStaticRoutes = 1024;
 /// 单条内存内容路由的上限 (大内容清用文件)
@@ -970,7 +971,6 @@ private:
 namespace utilxx {
 
 struct HttpRequestTask;
-struct HttpServerStream;
 struct TcpStream;
 struct WsStream;
 struct UdpChannel;
@@ -1030,6 +1030,8 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
     std::string url;             ///< http://host:port (只对 http / ws 有意义)
     /// 静态路由 (HTTP 服务专用; 按登记顺序匹配)
     std::vector<std::shared_ptr<StaticRoute>> routes;
+    /// HTTP 服务实例（kind == "http" 时由库提供服务；tcp / ws 还是自己 accept）
+    std::shared_ptr<utilxx::HttpServer> http;
   };
 
   std::map<std::string, std::shared_ptr<Server>> servers; ///< plugin|kind|id
@@ -1038,11 +1040,16 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   /// UDP 通道 (广播 / 组播 / 单播都走它; 一个通道 = 一个 socket)
   std::map<std::string, std::shared_ptr<UdpChannel>> udpChannels; ///< plugin|id
 
-  /// 等待插件回答的 HTTP 请求
+  /// 一条等插件回答的 HTTP 请求（handler 协程在这里等，`http.respond` 叫醒它）
+  struct PendingResponse {
+    Json payload;    ///< 插件给的响应（`answered` 为真时有效）
+    bool answered = false;
+    std::shared_ptr<asio::steady_timer> timer;
+  };
   struct PendingHttp {
     std::string plugin;
     std::string serverKey;
-    std::weak_ptr<Stream> stream;
+    std::shared_ptr<PendingResponse> wait;
   };
   std::map<int64_t, PendingHttp> pendingHttp;
 
@@ -1118,6 +1125,20 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   /// 起一个监听; 失败写 err
   bool listenServer(std::shared_ptr<Server> server, std::string &err);
 
+  /// 起一个 HTTP 服务（交给库的 `HttpServer`，不自建 accept 循环）
+  bool listenHttpServer(const std::shared_ptr<Server> &server,
+                        std::string &err);
+
+  /// 一条 HTTP 请求的兑底处理：静态内存路由 -> 插件回答 -> 504
+  asio::awaitable<void> handleHttpRequest(
+      const std::shared_ptr<Server> &server,
+      utilxx::HttpServer::Request &req,
+      utilxx::HttpServer::Response &resp,
+      std::string_view path, std::string_view peer);
+
+  /// 把静态路由同步给库的服务（文件走 `enableFileRoute`，内存内容在兑底里比对）
+  void rebuildHttpFileRoutes(const Server &server);
+
   void acceptNext(const std::shared_ptr<Server> &server);
 
   /// 接受一条连接并创建对应的 Stream 实现
@@ -1158,11 +1179,12 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
 
   /// 登记一个等待回答的请求; 超出上限返回 0
   int64_t registerPendingHttp(const std::shared_ptr<Server> &server,
-                              const std::shared_ptr<Stream> &stream);
-  std::shared_ptr<Stream> takePendingHttp(int64_t requestId,
-                                          std::string *plugin);
-  void dropPendingHttpOfStream(const Stream *stream);
+                              const std::shared_ptr<PendingResponse> &wait);
+  std::shared_ptr<PendingResponse> takePendingHttp(int64_t requestId,
+                                                   std::string *plugin);
   void dropPendingHttp(int64_t requestId);
+  /// 叫醒某个服务下所有等回答的请求（服务停了 / 插件卸载了）
+  void wakePendingOfServer(const std::string &serverKey);
 
   /* ---------- HTTP 客户端 ---------- */
 
@@ -1441,7 +1463,6 @@ void PluginNetHub::Impl::onStreamClosed(const std::shared_ptr<Stream> &stream) {
       server->conns.erase(stream->id);
     }
   }
-  dropPendingHttpOfStream(stream.get());
 }
 
 std::shared_ptr<PluginNetHub::Impl::Server>
@@ -1491,6 +1512,10 @@ bool PluginNetHub::Impl::listenServer(std::shared_ptr<Server> server,
   }
   if (!resolveBindHost(server->host, err)) {
     return false;
+  }
+  if (server->kind == "http") {
+    // HTTP 服务交给库（它有 accept 循环、路由、静态文件与保活）
+    return listenHttpServer(server, err);
   }
   try {
     asio::ip::tcp::endpoint endpoint{
@@ -1695,6 +1720,8 @@ bool PluginNetHub::Impl::addStaticRoute(const std::shared_ptr<Server> &server,
   if (!reused) {
     server->routes.push_back(route);
   }
+  // 库那边的文件路由表要跟着改（内存内容由兑底处理器按路由表现查，不用动）
+  rebuildHttpFileRoutes(*server);
 
   out = Json::object();
   out["ok"] = true;
@@ -1730,18 +1757,284 @@ bool PluginNetHub::Impl::removeStaticRoute(const std::shared_ptr<Server> &server
   for (auto it = server->routes.begin(); it != server->routes.end(); ++it) {
     if (*it && (*it)->path == path) {
       server->routes.erase(it);
+      rebuildHttpFileRoutes(*server);
       return true;
     }
   }
   return false;
+}
+/* ==================== HTTP 服务端（交给库的 HttpServer） ==================== */
+
+namespace {
+
+/// 回一条固定文本的小响应（内部错误 / 404 / 503 / 504 用）
+void setSimpleHttpResponse(utilxx::HttpServer::Request &req,
+                           utilxx::HttpServer::Response &resp,
+                           boost::beast::http::status status,
+                           std::string_view text) {
+  namespace http = boost::beast::http;
+  resp.version(req.version());
+  resp.result(status);
+  resp.set(http::field::content_type, "text/plain; charset=utf-8");
+  resp.body().assign(std::string{text} + "\n");
+  resp.keep_alive(req.keep_alive());
+}
+
+/// 把插件给的响应（status / headers / body|bodyBase64 / contentType）填进响应
+void fillHttpResponse(utilxx::HttpServer::Request &req,
+                      utilxx::HttpServer::Response &resp,
+                      const Json &payload) {
+  namespace http = boost::beast::http;
+  int status = 200;
+  if (payload.is_object() && payload.contains("status")) {
+    const Json &value = payload["status"];
+    if (value.is_number_integer()) {
+      status = static_cast<int>(value.get<int64_t>());
+    }
+  }
+  if (status < 100 || status > 599) {
+    status = 500;
+  }
+  std::string body;
+  bool fromBase64 = false;
+  if (payload.is_object()) {
+    const std::string base64 = payload.value("bodyBase64", std::string{});
+    if (!base64.empty()) {
+      const auto decoded = utilxx_base::base64Decode(base64);
+      if (decoded.has_value()) {
+        body = *decoded;
+        fromBase64 = true;
+      }
+    }
+    if (!fromBase64) {
+      body = payload.value("body", std::string{});
+      if (body.empty()) {
+        body = payload.value("text", std::string{});
+      }
+    }
+  }
+  if (status == 204 || status == 304) {
+    body.clear();
+  }
+  resp.version(req.version());
+  resp.result(status);
+  bool hasContentType = false;
+  if (payload.is_object() && payload["headers"].is_object()) {
+    for (const auto &item : payload["headers"].items()) {
+      const std::string name{item.first};
+      if (iequals(name, "content-type")) {
+        hasContentType = true;
+      }
+      resp.set(name, toSafeText(jsonTextOf(item.second)));
+    }
+  }
+  if (!hasContentType) {
+    resp.set(http::field::content_type,
+             payload.is_object()
+                 ? payload.value("contentType",
+                                 std::string{"application/octet-stream"})
+                 : std::string{"application/octet-stream"});
+  }
+  resp.body() = std::move(body);
+  resp.keep_alive(req.keep_alive());
+}
+
+/// 回一条静态内存路由（200 / 206 / 416）；文件内容的静态路由由库直接发
+void setStaticContentResponse(
+    utilxx::HttpServer::Request &req, utilxx::HttpServer::Response &resp,
+    const PluginNetHub::Impl::Server::StaticRoute &route) {
+  namespace http = boost::beast::http;
+  const int64_t size = route.size;
+  const auto rangeField = req[http::field::range];
+  const ByteRange range = parseRangeHeader(
+      std::string{rangeField.data(), rangeField.size()}, size);
+  if (range.present && !range.satisfiable) {
+    resp.version(req.version());
+    resp.result(http::status::range_not_satisfiable);
+    resp.set(http::field::content_range, "bytes */" + std::to_string(size));
+    resp.body().clear();
+    resp.keep_alive(req.keep_alive());
+    return;
+  }
+  const bool partial = range.present && size > 0;
+  const int64_t start = partial ? range.start : 0;
+  const int64_t length =
+      size <= 0 ? 0 : (partial ? range.end - range.start + 1 : size);
+  resp.version(req.version());
+  resp.result(partial ? http::status::partial_content : http::status::ok);
+  resp.set(http::field::content_type, route.contentType.empty()
+                                          ? "application/octet-stream"
+                                          : route.contentType);
+  resp.set(http::field::accept_ranges, "bytes");
+  resp.set(http::field::cache_control, "no-store");
+  if (partial) {
+    resp.set(http::field::content_range,
+             "bytes " + std::to_string(start) + "-" +
+                 std::to_string(start + length - 1) + "/" + std::to_string(size));
+  }
+  resp.body() = route.bytes.substr(static_cast<size_t>(start),
+                                   static_cast<size_t>(length));
+  resp.keep_alive(req.keep_alive());
+}
+
+/// 版本号 → 事件里的版本串
+std::string httpVersionText(unsigned version) {
+  if (version == 11) {
+    return "HTTP/1.1";
+  }
+  if (version == 10) {
+    return "HTTP/1.0";
+  }
+  return "HTTP/1." + std::to_string(version % 10);
+}
+
+} // namespace
+
+bool PluginNetHub::Impl::listenHttpServer(const std::shared_ptr<Server> &server,
+                                          std::string &err) {
+  utilxx::HttpServer::Config config;
+  config.address = server->host;
+  config.port = server->port;
+  config.requestTimeout = std::chrono::seconds{
+      (std::max)(int64_t{1}, static_cast<int64_t>((server->requestTimeoutMs + 999) / 1000))};
+  config.maxConnections =
+      static_cast<size_t>((std::max)(int32_t{1}, server->maxConnections));
+  // 请求体上限跟着插件给的 maxBodyBytes 走（库超出会自己回 413）
+  config.maxRequestBody =
+      static_cast<uint64_t>((std::max)(int64_t{0}, server->maxBody));
+  // 插件服务不打访问日志: 网络事件里已经能看出谁请求了什么
+  config.accessLogEnabled = false;
+  auto http = std::make_shared<utilxx::HttpServer>(config);
+  auto self = shared_from_this();
+  http->setFallbackHandler(
+      [self, server](utilxx::HttpServer::Request &req,
+                     utilxx::HttpServer::Response &resp, std::string_view path,
+                     std::string_view peer) -> asio::awaitable<void> {
+        co_await self->handleHttpRequest(server, req, resp, path, peer);
+      });
+  try {
+    http->startAsync(io.get_executor());
+  } catch (const std::exception &e) {
+    err = osTextToUtf8(e.what());
+    return false;
+  }
+  server->http = http;
+  server->port = http->port();
+  server->url = "http://" + server->host + ":" +
+                std::to_string(server->port) + server->pathPrefix;
+  servers[serverKeyOf(server->plugin, server->kind, server->id)] = server;
+  rebuildHttpFileRoutes(*server);
+  return true;
+}
+
+void PluginNetHub::Impl::rebuildHttpFileRoutes(const Server &server) {
+  if (!server.http) {
+    return;
+  }
+  // 库按路径表精确匹配文件路由；改过静态路由就整表重发一遍（最多 1024 条，很便宜）
+  server.http->clearFileRoutes();
+  for (const auto &route : server.routes) {
+    if (route && !route->file.empty()) {
+      server.http->enableFileRoute(route->path, route->file, route->contentType);
+    }
+  }
+}
+
+asio::awaitable<void> PluginNetHub::Impl::handleHttpRequest(
+    const std::shared_ptr<Server> &server, utilxx::HttpServer::Request &req,
+    utilxx::HttpServer::Response &resp, std::string_view path,
+    std::string_view peer) {
+  auto self = shared_from_this();
+  namespace http = boost::beast::http;
+  const std::string fullPath{path};
+
+  // 服务带路径前缀时，前缀之外的请求直接 404（与旧实现一致）
+  if (!server->pathPrefix.empty() && !startsWith(fullPath, server->pathPrefix)) {
+    setSimpleHttpResponse(req, resp, http::status::not_found, "not found");
+    co_return;
+  }
+
+  // 静态路由（内存内容）：命中后由框架直接回，不发 http.request 事件
+  if (req.method() == http::verb::get || req.method() == http::verb::head) {
+    if (auto route = findStaticRoute(*server, fullPath)) {
+      setStaticContentResponse(req, resp, *route);
+      co_return;
+    }
+  }
+  if (server->staticOnly) {
+    // 这个服务就是拿来发静态内容的：没命中就 404，不去等插件回答
+    setSimpleHttpResponse(req, resp, http::status::not_found, "没有这条静态路由");
+    co_return;
+  }
+
+  auto wait = std::make_shared<PendingResponse>();
+  const int64_t requestId = registerPendingHttp(server, wait);
+  if (requestId == 0) {
+    setSimpleHttpResponse(req, resp, http::status::service_unavailable,
+                          "等待回答的请求过多");
+    co_return;
+  }
+  wait->timer = std::make_shared<asio::steady_timer>(io);
+  wait->timer->expires_after(std::chrono::milliseconds{
+      (std::max)(int64_t{1000}, static_cast<int64_t>(server->requestTimeoutMs))});
+
+  const std::string target{req.target()};
+  std::string targetPath;
+  std::string targetQuery;
+  splitTarget(target, targetPath, targetQuery);
+  const std::string &body = req.body();
+
+  Json event;
+  event["kind"] = "http.request";
+  event["serverId"] = server->id;
+  event["requestId"] = requestId;
+  event["method"] = toSafeText(req.method_string());
+  event["path"] = toSafeText(fullPath);
+  event["query"] = toSafeText(targetQuery);
+  event["target"] = toSafeText(target);
+  event["version"] = httpVersionText(req.version());
+  {
+    Json headers = Json::object();
+    for (const auto &field : req) {
+      const std::string key = lowerAscii(toSafeText(field.name_string()));
+      const std::string value = toSafeText(field.value());
+      if (headers.contains(key)) {
+        // 重复头（Cookie 等）用换行拼起来，与旧实现一致
+        const std::string previous = headers.value(key, std::string{});
+        headers[key] = previous + "\n" + value;
+      } else {
+        headers[key] = value;
+      }
+    }
+    event["headers"] = std::move(headers);
+  }
+  event["remote"] = toSafeText(peer);
+  event["bodyBytes"] = static_cast<int64_t>(body.size());
+  event["bodyBase64"] = utilxx_base::base64Encode(body);
+  if (isValidUtf8(body)) {
+    event["body"] = toSafeText(body);
+    event["text"] = toSafeText(body);
+  }
+  emit(server->plugin, std::move(event));
+
+  AsioErrorCode ec;
+  co_await wait->timer->async_wait(
+      asio::redirect_error(asio::use_awaitable, ec));
+  dropPendingHttp(requestId);
+  if (!wait->answered) {
+    setSimpleHttpResponse(req, resp, http::status::gateway_timeout,
+                          "插件没有在时限内回答请求");
+    co_return;
+  }
+  fillHttpResponse(req, resp, wait->payload);
 }
 
 /* ==================== HTTP 服务端 (等插件回答) ==================== */
 
 int64_t PluginNetHub::Impl::registerPendingHttp(
     const std::shared_ptr<Server> &server,
-    const std::shared_ptr<Stream> &stream) {
-  if (!server || !stream) {
+    const std::shared_ptr<PendingResponse> &wait) {
+  if (!server || !wait) {
     return 0;
   }
   if (server->pending >= kMaxHttpPendingPerServer) {
@@ -1751,13 +2044,13 @@ int64_t PluginNetHub::Impl::registerPendingHttp(
   PendingHttp pending;
   pending.plugin = server->plugin;
   pending.serverKey = serverKeyOf(server->plugin, server->kind, server->id);
-  pending.stream = stream;
+  pending.wait = wait;
   pendingHttp[requestId] = std::move(pending);
   ++server->pending;
   return requestId;
 }
 
-std::shared_ptr<Stream>
+std::shared_ptr<PluginNetHub::Impl::PendingResponse>
 PluginNetHub::Impl::takePendingHttp(int64_t requestId, std::string *plugin) {
   const auto it = pendingHttp.find(requestId);
   if (it == pendingHttp.end()) {
@@ -1771,9 +2064,9 @@ PluginNetHub::Impl::takePendingHttp(int64_t requestId, std::string *plugin) {
       serverIt->second->pending > 0) {
     --serverIt->second->pending;
   }
-  auto stream = it->second.stream.lock();
+  auto wait = it->second.wait;
   pendingHttp.erase(it);
-  return stream;
+  return wait;
 }
 
 void PluginNetHub::Impl::dropPendingHttp(int64_t requestId) {
@@ -1781,18 +2074,17 @@ void PluginNetHub::Impl::dropPendingHttp(int64_t requestId) {
   (void)takePendingHttp(requestId, &plugin);
 }
 
-void PluginNetHub::Impl::dropPendingHttpOfStream(const Stream *stream) {
+void PluginNetHub::Impl::wakePendingOfServer(const std::string &serverKey) {
   for (auto it = pendingHttp.begin(); it != pendingHttp.end();) {
-    if (it->second.stream.lock().get() == stream) {
-      const auto serverIt = servers.find(it->second.serverKey);
-      if (serverIt != servers.end() && serverIt->second &&
-          serverIt->second->pending > 0) {
-        --serverIt->second->pending;
-      }
-      it = pendingHttp.erase(it);
-    } else {
+    if (it->second.serverKey != serverKey) {
       ++it;
+      continue;
     }
+    // 服务停了：让还在等的 handler 回 504 收尾（不算"插件回答过"）
+    if (it->second.wait && it->second.wait->timer) {
+      it->second.wait->timer->cancel();
+    }
+    it = pendingHttp.erase(it);
   }
 }
 
@@ -1804,6 +2096,12 @@ void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
   for (auto it = servers.begin(); it != servers.end();) {
     if (!it->second ||
         (allPlugins ? true : it->second->plugin == plugin)) {
+      if (it->second->http) {
+        // 库的服务: 关监听并叫醒还在等回答的请求（handler 会回 504）
+        it->second->http->stop();
+        wakePendingOfServer(
+            serverKeyOf(it->second->plugin, it->second->kind, it->second->id));
+      }
       if (it->second->acceptor) {
         AsioErrorCode ignored;
         it->second->acceptor->close(ignored);
@@ -1831,6 +2129,9 @@ void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
   // 4) 未回答的 HTTP 请求与未完成的客户端请求
   for (auto it = pendingHttp.begin(); it != pendingHttp.end();) {
     if (allPlugins || it->second.plugin == plugin) {
+      if (it->second.wait && it->second.wait->timer) {
+        it->second.wait->timer->cancel();
+      }
       it = pendingHttp.erase(it);
     } else {
       ++it;
@@ -1855,449 +2156,6 @@ void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
     emit(item.second, std::move(event));
   }
 }
-
-/* ==================== HTTP 服务端连接 ==================== */
-
-struct HttpServerStream : Stream {
-  explicit HttpServerStream(std::shared_ptr<PluginNetHub::Impl> hubRef,
-                            asio::ip::tcp::socket socketRef)
-      : Stream(std::move(hubRef), std::move(socketRef)) {}
-
-  std::shared_ptr<PluginNetHub::Impl::Server> server;
-  std::string in;
-  std::string currentMethod = "GET";
-  bool waitingResponse = false;
-  int64_t pendingRequestId = 0;
-  bool keepAlive = false;
-  std::unique_ptr<asio::steady_timer> timeout;
-
-  // 静态内容 (文件 / 内存) 的发送状态
-  std::shared_ptr<PluginNetHub::Impl::Server::StaticRoute> staticRoute;
-  std::unique_ptr<std::ifstream> staticFile;
-  int64_t staticBodyStart = 0;
-  int64_t staticBodySize = 0;
-  int64_t staticSent = 0;
-  bool staticActive = false;
-
-  const char *kind() const override { return "http"; }
-
-  void onWritten() override {
-    if (staticActive) {
-      pumpStatic();
-    }
-  }
-
-  void closeStaticFile() {
-    if (staticFile) {
-      staticFile->close();
-      staticFile.reset();
-    }
-  }
-
-  /// 命中静态路由: 直接读文件 / 内存内容回一条 200 / 206 / 416
-  ///
-  /// 字节按 `kStaticChunk` 一块地发, 队列快满时先停下等 `onWritten` —— 大文件不会被
-  /// 整个读进内存, 也不会把发送队列撞到上限。
-  void startStatic(
-      const std::shared_ptr<PluginNetHub::Impl::Server::StaticRoute> &route,
-      const std::string &rangeHeader, bool isHead) {
-    staticRoute = route;
-    const int64_t size = route->size;
-    const ByteRange range = parseRangeHeader(rangeHeader, size);
-    if (range.present && !range.satisfiable) {
-      std::string head =
-          "HTTP/1.1 416 Range Not Satisfiable\r\nAccept-Ranges: bytes\r\n";
-      head += "Content-Range: bytes */" + std::to_string(size) +
-              "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-      std::string err;
-      send(std::move(head), err);
-      if (!err.empty()) {
-        closeStream("error", err);
-        return;
-      }
-      flushThenClose();
-      return;
-    }
-
-    const bool partial = range.present && size > 0;
-    staticBodyStart = partial ? range.start : 0;
-    staticBodySize =
-        size <= 0 ? 0 : (partial ? range.end - range.start + 1 : size);
-    staticSent = 0;
-    if (!route->file.empty()) {
-      staticFile = std::make_unique<std::ifstream>(pathFromUtf8(route->file),
-                                                   std::ios::binary);
-      if (!staticFile->is_open()) {
-        staticFile.reset();
-        writeSimple(404, "文件打不开");
-        flushThenClose();
-        return;
-      }
-      if (staticBodyStart > 0) {
-        staticFile->seekg(staticBodyStart);
-      }
-    }
-
-    std::string head = partial ? "HTTP/1.1 206 Partial Content\r\n"
-                              : "HTTP/1.1 200 OK\r\n";
-    head += "Content-Type: " + route->contentType + "\r\n";
-    head += "Content-Length: " + std::to_string(staticBodySize) + "\r\n";
-    head += "Accept-Ranges: bytes\r\n";
-    if (partial) {
-      head += "Content-Range: bytes " + std::to_string(staticBodyStart) +
-              "-" +
-              std::to_string(staticBodyStart + staticBodySize - 1) + "/" +
-              std::to_string(size) + "\r\n";
-    }
-    head += "Cache-Control: no-store\r\n";
-    head += std::string{"Connection: "} + (keepAlive ? "keep-alive" : "close") +
-            "\r\n\r\n";
-    std::string err;
-    send(std::move(head), err);
-    if (!err.empty()) {
-      closeStaticFile();
-      closeStream("error", err);
-      return;
-    }
-    if (isHead || staticBodySize == 0) {
-      finishStatic();
-      return;
-    }
-    staticActive = true;
-    pumpStatic();
-  }
-
-  /// 继续发静态内容 (队列快满就返回, 等下一次 `onWritten`)
-  void pumpStatic() {
-    if (!staticActive || closing) {
-      return;
-    }
-    while (staticSent < staticBodySize) {
-      if (outBytes >= kMaxOutQueue / 2) {
-        return;
-      }
-      const size_t want = static_cast<size_t>((std::min)(
-          static_cast<int64_t>(kStaticChunk), staticBodySize - staticSent));
-      std::string chunk;
-      if (staticFile) {
-        chunk.resize(want);
-        staticFile->read(chunk.data(), static_cast<std::streamsize>(want));
-        const std::streamsize got = staticFile->gcount();
-        if (got <= 0) {
-          staticActive = false;
-          closeStaticFile();
-          closeStream("error", "读文件失败 (文件被截断?)");
-          return;
-        }
-        chunk.resize(static_cast<size_t>(got));
-      } else if (staticRoute) {
-        chunk.assign(staticRoute->bytes,
-                     static_cast<size_t>(staticBodyStart + staticSent), want);
-      }
-      if (chunk.empty()) {
-        break;
-      }
-      const size_t produced = chunk.size();
-      std::string err;
-      send(std::move(chunk), err);
-      if (!err.empty()) {
-        staticActive = false;
-        closeStaticFile();
-        closeStream("error", err);
-        return;
-      }
-      staticSent += static_cast<int64_t>(produced);
-    }
-    if (staticSent >= staticBodySize) {
-      finishStatic();
-    }
-  }
-
-  void finishStatic() {
-    staticActive = false;
-    closeStaticFile();
-    staticRoute.reset();
-    if (!keepAlive || closing) {
-      flushThenClose();
-      return;
-    }
-    // keep-alive: 继续处理下一条请求 (剩余字节可能已经在缓冲里)
-    process();
-  }
-
-  void onBytes(const char *data, size_t size) override {
-    if (waitingResponse) {
-      // 一次只处理一条请求 (不做流水线): 多余字节先留着, 回答完再解析
-      if (in.size() + size > kMaxHeadBytes + static_cast<size_t>(kMaxHttpBody)) {
-        closeStream("bad_request", "请求过大");
-        return;
-      }
-    }
-    in.append(data, size);
-    process();
-  }
-
-  void onClosed(std::string_view /*reason*/, std::string_view /*error*/) override {
-    if (pendingRequestId != 0 && hub) {
-      hub->dropPendingHttp(pendingRequestId);
-      pendingRequestId = 0;
-    }
-    waitingResponse = false;
-    staticActive = false;
-    closeStaticFile();
-    if (timeout) {
-      AsioErrorCode ignored;
-      timeout->cancel();
-    }
-  }
-
-  void armTimeout() {
-    if (!timeout) {
-      timeout = std::make_unique<asio::steady_timer>(hub->io);
-    }
-    AsioErrorCode ignored;
-    timeout->cancel();
-    const int32_t budget =
-        server ? (std::max)(1000, server->requestTimeoutMs) : 30000;
-    timeout->expires_after(std::chrono::milliseconds{budget});
-    auto self = std::static_pointer_cast<HttpServerStream>(shared_from_this());
-    timeout->async_wait([self](AsioErrorCode ec) {
-      if (ec || !self->waitingResponse) {
-        return;
-      }
-      // 插件没在时限内回答: 回 504 并关掉连接 (待回答登记同时作废)
-      if (self->pendingRequestId != 0) {
-        self->hub->dropPendingHttp(self->pendingRequestId);
-        self->pendingRequestId = 0;
-      }
-      self->waitingResponse = false;
-      self->writeSimple(504, "插件没有在时限内回答请求");
-      self->flushThenClose();
-    });
-  }
-
-  void process() {
-    /// 静态内容正在发送时不再解析下一条请求 (不做流水线; 剩下的字节发完再处理)
-    if (waitingResponse || staticActive || closing) {
-      return;
-    }
-    const size_t headEnd = in.find("\r\n\r\n");
-    if (headEnd == std::string::npos) {
-      if (in.size() > kMaxHeadBytes) {
-        writeSimple(431, "请求头过大");
-        flushThenClose();
-      }
-      return;
-    }
-    HttpHead head;
-    if (!parseHttpHead(std::string_view{in}.substr(0, headEnd), true, head)) {
-      writeSimple(400, "请求头解析失败");
-      flushThenClose();
-      return;
-    }
-    const std::string transfer = lowerAscii(head.header("transfer-encoding"));
-    if (!transfer.empty() && transfer.find("chunked") != std::string::npos) {
-      // 分块请求体不做解码: 直接告诉调用方用 Content-Length
-      writeSimple(411, "请求体请用 Content-Length");
-      flushThenClose();
-      return;
-    }
-    int64_t bodyLength = 0;
-    const std::string lengthText = head.header("content-length");
-    if (!lengthText.empty()) {
-      try {
-        bodyLength = std::stoll(lengthText);
-      } catch (...) {
-        writeSimple(400, "Content-Length 不是数字");
-        flushThenClose();
-        return;
-      }
-      if (bodyLength < 0) {
-        writeSimple(400, "Content-Length 为负");
-        flushThenClose();
-        return;
-      }
-    }
-    const int64_t maxBody = server ? server->maxBody : kMaxHttpBody;
-    if (bodyLength > maxBody) {
-      writeSimple(413, "请求体超过上限");
-      flushThenClose();
-      return;
-    }
-    if (in.size() < headEnd + 4 + static_cast<size_t>(bodyLength)) {
-      return; ///< 正文还没到齐
-    }
-    std::string body = in.substr(headEnd + 4, static_cast<size_t>(bodyLength));
-    in.erase(0, headEnd + 4 + static_cast<size_t>(bodyLength));
-
-    const std::string connection = lowerAscii(head.header("connection"));
-    keepAlive = (head.version == "HTTP/1.1" && connection != "close") ||
-                connection == "keep-alive";
-    currentMethod = head.method;
-
-    std::string path;
-    std::string query;
-    splitTarget(head.target, path, query);
-    if (server && !server->pathPrefix.empty() &&
-        !startsWith(path, server->pathPrefix)) {
-      writeResponseJson([] {
-        Json out = Json::object();
-        out["status"] = 404;
-        out["body"] = "not found";
-        out["contentType"] = "text/plain; charset=utf-8";
-        return out;
-      }());
-      return;
-    }
-
-    // 静态路由 (文件 / 内存内容) 不进插件, 直接由这里回 200 / 206 / 416
-    bool staticHit = false;
-    if (server && (head.method == "GET" || head.method == "HEAD")) {
-      if (auto route = hub->findStaticRoute(*server, path)) {
-        startStatic(route, head.header("range"), head.method == "HEAD");
-        staticHit = true;
-      }
-    }
-    if (!staticHit && server && server->staticOnly) {
-      // 服务就是拿来发静态内容的: 没命中就 404, 不去等插件回答
-      keepAlive = false;
-      writeSimple(404, "没有这条静态路由");
-      flushThenClose();
-      return;
-    }
-    if (staticHit) {
-      return;
-    }
-
-    waitingResponse = true;
-    pendingRequestId = hub->registerPendingHttp(server, shared_from_this());
-    if (pendingRequestId == 0) {
-      waitingResponse = false;
-      writeSimple(503, "等待回答的请求过多");
-      flushThenClose();
-      return;
-    }
-    Json event;
-    event["kind"] = "http.request";
-    event["serverId"] = serverId;
-    event["requestId"] = pendingRequestId;
-    event["method"] = toSafeText(head.method);
-    event["path"] = toSafeText(path);
-    event["query"] = toSafeText(query);
-    event["target"] = toSafeText(head.target);
-    event["version"] = head.version;
-    event["headers"] = head.headersJson();
-    event["remote"] = remote;
-    event["bodyBytes"] = static_cast<int64_t>(body.size());
-    const std::string bodyBase64 = utilxx_base::base64Encode(body);
-    event["bodyBase64"] = bodyBase64;
-    if (isValidUtf8(body)) {
-      event["body"] = body;
-      event["text"] = body;
-    }
-    hub->emit(plugin, std::move(event));
-    armTimeout();
-  }
-
-  /// 用固定文本回一条简单响应 (解析失败 / 超限等内部错误)
-  void writeSimple(int status, std::string_view text) {
-    Json out = Json::object();
-    out["status"] = status;
-    out["contentType"] = "text/plain; charset=utf-8";
-    out["body"] = std::string{text} + "\n";
-    writeResponseJson(out);
-  }
-
-  /// 按插件给的响应写回去 (status / headers / body|bodyBase64|text / contentType)
-  void writeResponseJson(const Json &response) {
-    int status = 200;
-    if (response.is_object() && response.contains("status")) {
-      const Json &value = response["status"];
-      if (value.is_number_integer()) {
-        status = static_cast<int>(value.get<int64_t>());
-      }
-    }
-    if (status < 100 || status > 599) {
-      status = 500;
-    }
-    std::string body;
-    bool bodyBase64 = false;
-    if (response.is_object()) {
-      const std::string base64 = response.value("bodyBase64", std::string{});
-      if (!base64.empty()) {
-        const auto decoded = utilxx_base::base64Decode(base64);
-        if (decoded.has_value()) {
-          body = *decoded;
-          bodyBase64 = true;
-        }
-      }
-      if (!bodyBase64) {
-        body = response.value("body", std::string{});
-        if (body.empty()) {
-          body = response.value("text", std::string{});
-        }
-      }
-    }
-
-    std::string out = "HTTP/1.1 " + std::to_string(status) + " " +
-                      statusTextOf(status) + "\r\n";
-    const bool isHead = currentMethod == "HEAD";
-    if (status == 204 || status == 304) {
-      body.clear();
-    }
-    bool hasContentType = false;
-    bool hasContentLength = false;
-    bool hasConnection = false;
-    if (response.is_object() && response["headers"].is_object()) {
-      const Json &headers = response["headers"];
-      for (const auto &item : headers.items()) {
-        const std::string name{item.first};
-        if (iequals(name, "content-type")) hasContentType = true;
-        if (iequals(name, "content-length")) hasContentLength = true;
-        if (iequals(name, "connection")) hasConnection = true;
-        out += name + ": " + toSafeText(jsonTextOf(item.second)) + "\r\n";
-      }
-    }
-    if (!hasContentType) {
-      const std::string contentType =
-          response.is_object()
-              ? response.value("contentType",
-                               std::string{"application/octet-stream"})
-              : std::string{"application/octet-stream"};
-      out += "Content-Type: " + contentType + "\r\n";
-    }
-    if (!hasContentLength) {
-      out += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-    }
-    if (!hasConnection) {
-      out += std::string{"Connection: "} + (keepAlive ? "keep-alive" : "close") +
-             "\r\n";
-    }
-    out += "\r\n";
-    if (!isHead) {
-      out += body;
-    }
-
-    waitingResponse = false;
-    pendingRequestId = 0;
-    if (timeout) {
-      AsioErrorCode ignored;
-      timeout->cancel();
-    }
-    std::string err;
-    send(std::move(out), err);
-    if (!err.empty()) {
-      closeStream("error", err);
-      return;
-    }
-    if (!keepAlive) {
-      flushThenClose();
-      return;
-    }
-    // keep-alive: 写完以后继续读下一条 (剩余字节可能已经在缓冲里)
-    process();
-  }
-};
 
 /* ==================== TCP 连接 ==================== */
 
@@ -3483,12 +3341,7 @@ void PluginNetHub::Impl::onAccepted(const std::shared_ptr<Server> &server,
   const std::string connId = server->id + "#" + std::to_string(seq);
 
   std::shared_ptr<Stream> stream;
-  if (server->kind == "http") {
-    auto http = std::make_shared<HttpServerStream>(shared_from_this(),
-                                                   std::move(socket));
-    http->server = server;
-    stream = http;
-  } else if (server->kind == "ws") {
+  if (server->kind == "ws") {
     auto ws = std::make_shared<WsStream>(shared_from_this(), std::move(socket));
     ws->server = server;
     ws->roleClient = false;
@@ -3973,6 +3826,11 @@ void PluginNetHub::Impl::stopServers(const std::string &plugin,
   int32_t stopped = 0;
   for (const auto &server : closing) {
     ++stopped;
+    if (server->http) {
+      server->http->stop();
+      wakePendingOfServer(
+          serverKeyOf(server->plugin, server->kind, server->id));
+    }
     if (server->acceptor) {
       AsioErrorCode ignored;
       server->acceptor->close(ignored);
@@ -4135,7 +3993,9 @@ std::string PluginNetHub::Impl::infoJsonOnThread(const std::string &plugin,
     if (!server->pathPrefix.empty()) {
       row["path"] = server->pathPrefix;
     }
-    row["connections"] = static_cast<int64_t>(server->conns.size());
+    row["connections"] = server->http
+                             ? static_cast<int64_t>(server->http->activeConnections())
+                             : static_cast<int64_t>(server->conns.size());
     row["pending"] = static_cast<int64_t>(server->pending);
     if (server->staticOnly) {
       row["staticOnly"] = true;
@@ -4334,17 +4194,16 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
   if (op == "http.respond") {
     const int64_t requestId = args.value("requestId", int64_t{0});
     std::string owner;
-    const auto stream = takePendingHttp(requestId, &owner);
-    if (!stream || owner != plugin) {
+    const auto wait = takePendingHttp(requestId, &owner);
+    if (!wait || owner != plugin) {
       out = errorJson("not_found", "没有这条等待回答的请求");
       return PLUGINXX_NET_OK;
     }
-    const auto http = std::dynamic_pointer_cast<HttpServerStream>(stream);
-    if (!http) {
-      out = errorJson("wrong_kind", "这条请求不属于 HTTP 服务");
-      return PLUGINXX_NET_OK;
+    wait->payload = args;
+    wait->answered = true;
+    if (wait->timer) {
+      wait->timer->cancel();
     }
-    http->writeResponseJson(args);
     out = Json::object();
     out["ok"] = true;
     out["requestId"] = requestId;

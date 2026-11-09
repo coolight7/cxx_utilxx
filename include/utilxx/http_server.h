@@ -62,6 +62,17 @@ public:
     using WsStream  = boost::beast::websocket::stream<boost::beast::tcp_stream>;
     using WsHandler = std::function<asio::awaitable<void>(WsStream&)>;
 
+    /// 兜底处理器：路由没命中时调用（插件网络用它把请求交给插件自己回答）
+    ///
+    /// 参数：请求、响应、去 query 后的路径、对端地址（`1.2.3.4:5678`）。
+    /// 置了兜底处理器就不会再回 404 / 405，响应由处理器自己填。
+    using FallbackHandler = std::function<asio::awaitable<void>(
+        Request&,
+        Response&,
+        std::string_view path,
+        std::string_view peer
+    )>;
+
     /// 流式 SSE 连接 — 初始响应头发送后, handler 可持有本对象持续推送事件
     class SseWriter {
     public:
@@ -173,6 +184,9 @@ public:
 
     /// 清掉全部静态文件路由
     void clearFileRoutes();
+
+    /// 置兜底处理器（未注册路由时的请求都给它）；传空函数对象 = 取消
+    void setFallbackHandler(FallbackHandler handler);
 
     /// 在指定 executor 上启动 accept 循环而不创建线程。
     /// 调用方负责运行 io_context。适用于单线程服务模式 (如 agent 服务)。
@@ -516,6 +530,16 @@ private:
         std::string               readErrorMsg;
         http::status              readErrorStatus = http::status::bad_request;
         size_t                    requestCount    = 0; // 连接级请求计数 (防永久占用)
+        // 对端地址（兜底处理器要告诉调用方请求从哪来）
+        std::string peerText;
+        {
+            utilxx_base::AsioErrorCode peerEc;
+            const auto                 endpoint = stream.socket().remote_endpoint(peerEc);
+            if (!peerEc) {
+                peerText = endpoint.address().to_string() + ":"
+                           + std::to_string(endpoint.port());
+            }
+        }
         // WebSocket 升级后 stream 已被移入 ws stream, 收尾 shutdown 必须跳过
         bool streamMoved = false;
 
@@ -788,6 +812,35 @@ private:
                 }
             }
 
+            if (!handled && fallback_ && *fallback_) {
+                handled = co_await utilxx_base::catchErrorAsync<bool>(
+                    [&]() -> asio::awaitable<bool> {
+                        co_await (*fallback_)(
+                            req,
+                            resp,
+                            std::string_view{path},
+                            std::string_view{peerText}
+                        );
+                        co_return true;
+                    },
+                    [&](std::string errInfo) -> asio::awaitable<bool> {
+                        XX_LOGE(
+                            "[server] Fallback error [{} {}]: {}",
+                            req.method_string(),
+                            req.target(),
+                            errInfo
+                        );
+                        fillError(
+                            resp,
+                            req.version(),
+                            http::status::internal_server_error,
+                            "Internal Server Error"
+                        );
+                        co_return true;
+                    }
+                );
+            }
+
             if (!handled) {
                 std::string dummyPath;
                 // RFC 7231 §6.5.5: 405 响应必须携带 Allow 头, 列出该资源实际支持的方法
@@ -935,6 +988,9 @@ private:
     std::unordered_map<std::string, WsHandler> wsRoutes_;
 
     std::vector<FileRouteEntry> fileRoutes_;
+
+    /// 兜底处理器（空 = 没置）
+    std::shared_ptr<FallbackHandler> fallback_;
 
     /// 是否 startAsync 模式 (单 executor, 无 worker 线程)
     bool asyncMode_ = false;
