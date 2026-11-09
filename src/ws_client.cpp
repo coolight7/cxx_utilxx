@@ -490,15 +490,31 @@ asio::awaitable<std::expected<std::unique_ptr<WsClient>, std::string>> wsConnect
             );
 
             if (isSsl) {
-                auto& sslCtx    = HttpClient::sharedSslCtx(config.sslVerify);
-                auto  sslStream = beast::ssl_stream<beast::tcp_stream>(executor, sslCtx);
+                // 调用方给了自己的上下文（插件网络额外信任的 CA）就用它，否则用共享的
+                asio::ssl::context* ctx = &HttpClient::sharedSslCtx(config.sslVerify);
+                if (config.sslContext) {
+                    ctx = config.sslContext.get();
+                }
+                auto  sslStream = beast::ssl_stream<beast::tcp_stream>(executor, *ctx);
                 // SNI 与证书验证相互独立: 即使关闭验证也必须发送 SNI,
                 // 否则 CDN/网关按 SNI 路由时握手直接失败; IP 字面量 (含 ':') 不支持 SNI
-                if (host.find(':') == std::string::npos) {
-                    ::SSL_set_tlsext_host_name(sslStream.native_handle(), host.c_str());
+                const std::string sni
+                    = config.sslServerName.empty() ? std::string{host} : config.sslServerName;
+                if (!sni.empty() && sni.find(':') == std::string::npos) {
+                    ::SSL_set_tlsext_host_name(sslStream.native_handle(), sni.c_str());
                 }
                 if (!config.sslVerify) {
                     ::SSL_set_verify(sslStream.native_handle(), SSL_VERIFY_NONE, nullptr);
+                } else if (config.sslVerifyHost && !sni.empty()) {
+                    // 主机名校验: 插件客户端要校验证书里的名字与地址是否匹配
+                    utilxx_base::AsioErrorCode addressEc;
+                    const auto address = asio::ip::make_address(sni, addressEc);
+                    if (addressEc) {
+                        ::SSL_set1_host(sslStream.native_handle(), sni.c_str());
+                    } else {
+                        ::X509_VERIFY_PARAM_set1_ip_asc(
+                            ::SSL_get0_param(sslStream.native_handle()), sni.c_str());
+                    }
                 }
 
                 co_await beast::get_lowest_layer(sslStream).async_connect(

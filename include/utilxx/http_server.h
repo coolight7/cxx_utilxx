@@ -62,6 +62,12 @@ public:
     using WsStream  = boost::beast::websocket::stream<boost::beast::tcp_stream>;
     using WsHandler = std::function<asio::awaitable<void>(WsStream&)>;
 
+    /// 带握手请求的 WebSocket 处理器（任意路径升级用）
+    ///
+    /// 比 [WsHandler] 多拿到握手请求：路径、头、子协议都从里面读。
+    using WsRequestHandler
+        = std::function<asio::awaitable<void>(WsStream&, const Request&)>;
+
     /// 兜底处理器：路由没命中时调用（插件网络用它把请求交给插件自己回答）
     ///
     /// 参数：请求、响应、去 query 后的路径、对端地址（`1.2.3.4:5678`）。
@@ -167,6 +173,11 @@ public:
     /// 注册 WebSocket 端点。客户端向该路径发送带 Upgrade: websocket 的 GET
     /// 请求时连接被升级, 随后以 websocket 流调用该 handler。
     void enableWebSocket(std::string_view path, WsHandler handler);
+
+    /// 注册任意路径的 WebSocket 升级（没命中 `enableWebSocket` 的路径都交给它）
+    ///
+    /// 用处：调用方自己按请求里的路径 / 头做分流（插件的 `ws.listen` 就是这样）。
+    void enableWebSocketAny(WsRequestHandler handler);
 
     /// 注册静态文件路由（`GET` / `HEAD`，**精确匹配**路径；已带 query 的请求按去 query 后的路径比）
     ///
@@ -729,7 +740,7 @@ private:
             }
 
             // 检查 WebSocket 升级 (GET + Upgrade: websocket)
-            if (methodIdx == 0 && !handled && !wsRoutes_.empty()) {
+            if (methodIdx == 0 && !handled && (!wsRoutes_.empty() || wsAny_)) {
                 auto upgradeIt = req.find(http::field::upgrade);
                 if (upgradeIt != req.end()
                     && boost::beast::iequals(upgradeIt->value(), "websocket")) {
@@ -739,7 +750,11 @@ private:
                     auto wsOk = co_await utilxx_base::catchErrorAsync<bool>(
                         [&]() -> asio::awaitable<bool> {
                             auto wsIt = wsRoutes_.find(path);
-                            if (wsIt != wsRoutes_.end()) {
+                            const bool exact = wsIt != wsRoutes_.end();
+                            if (!exact && !wsAny_) {
+                                co_return false;
+                            }
+                            {
                                 streamMoved = true;
                                 boost::beast::websocket::stream<boost::beast::tcp_stream> ws(
                                     std::move(stream)
@@ -756,7 +771,11 @@ private:
                                         asio::use_awaitable
                                     )
                                 );
-                                co_await wsIt->second(ws);
+                                if (exact) {
+                                    co_await wsIt->second(ws);
+                                } else {
+                                    co_await (*wsAny_)(ws, req);
+                                }
                                 co_return true;
                             }
                             co_return false;
@@ -986,6 +1005,9 @@ private:
 
     /// WebSocket 路由 (GET + Upgrade) — 按路径索引
     std::unordered_map<std::string, WsHandler> wsRoutes_;
+
+    /// 任意路径升级的处理器（空 = 没置）
+    std::shared_ptr<WsRequestHandler> wsAny_;
 
     std::vector<FileRouteEntry> fileRoutes_;
 

@@ -18,6 +18,7 @@
 #include "utilxx/http_server.h"
 #include "utilxx/tcp.h"
 #include "utilxx/udp.h"
+#include "utilxx/ws_client.h"
 
 
 #include "utilxx_base/asio_error.h"
@@ -924,11 +925,13 @@ struct SyncSlot {
 
 /// 一条 TCP 连接 (客户端或服务端接受的那一端)
 struct Stream : std::enable_shared_from_this<Stream> {
-  Stream(std::shared_ptr<PluginNetHub::Impl> hub, asio::ip::tcp::socket socket);
-
-  /// 接管库的一条 TCP 连接（发送队列、暂停、事件与 NetStream 那条路一致）
+  /// 接管库的一条 TCP 连接（发送队列、暂停、事件与 WebSocket 那条路一致）
   Stream(std::shared_ptr<PluginNetHub::Impl> hub,
          std::shared_ptr<utilxx::TcpConnection> connection);
+
+  /// 接管库的一条 WebSocket 连接（握手已完成）
+  Stream(std::shared_ptr<PluginNetHub::Impl> hub,
+         std::shared_ptr<utilxx::WsClient> connection);
   virtual ~Stream() = default;
 
   std::shared_ptr<PluginNetHub::Impl> hub;
@@ -938,12 +941,20 @@ struct Stream : std::enable_shared_from_this<Stream> {
   std::string remote;
   std::string local;
 
-  /// 连接的读写层: 纯 TCP 或客户端 TLS (建好之后所有读写都经过它)
-  std::shared_ptr<NetStream> io;
+  /// 连接的读写层: 库的 TCP 连接或 WebSocket 连接（二者都为空 = 还没连上）
   /// 走库的 `TcpConnection` 时非空（与 `io` 二选一）
   std::shared_ptr<utilxx::TcpConnection> tcpConn;
+  /// 走库的 `WsClient` 时非空（WebSocket 客户端与已接受的服务端连接都用它）
+  std::shared_ptr<utilxx::WsClient> wsClient;
+
+  /// 一条待发的字节（WebSocket 要区分文本 / 二进制 / 控制帧，其余走 opcode 0）
+  struct OutItem {
+    std::string data;
+    int32_t opcode = 0;
+  };
   std::vector<char> readBuf;
-  std::deque<std::string> outQueue;
+  std::deque<OutItem> outQueue;
+  /// 发送队列里还没写出去的字节数（`socket.send` 的 `queuedBytes` 就是它）
   size_t outBytes = 0;
   bool writing = false;
   bool closing = false;
@@ -962,8 +973,17 @@ struct Stream : std::enable_shared_from_this<Stream> {
   void startRead();
   void setPaused(bool value);
   void send(std::string data, std::string &err);
+
+  /// WebSocket 用: 带帧类型的发送（`opcode`: 1 文本 / 2 二进制 / 9 ping）
+  void sendWs(int32_t opcode, std::string data, std::string &err);
   void flushThenClose();
   void closeStream(std::string_view reason, std::string_view error);
+
+  /// 收到一条 WebSocket 消息（默认忽略；WebSocket 连接自己实现）
+  virtual void onWsMessage(bool text, const std::string &payload) {
+    (void)text;
+    (void)payload;
+  }
 
   /// 收到字节 (网络线程; 实现里可以直接 closeStream)
   virtual void onBytes(const char *data, size_t size) = 0;
@@ -1034,7 +1054,6 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
     std::string pathPrefix; ///< http / ws 的路径前缀 (空 = 不限制)
     /// 只当静态文件服务用: 没命中静态路由的请求直接回 404, 不发 `http.request`
     bool staticOnly = false;
-    std::shared_ptr<asio::ip::tcp::acceptor> acceptor;
     int64_t maxBody = kMaxHttpBody;
     int32_t requestTimeoutMs = 30000;
     int32_t maxConnections = 32;
@@ -1147,6 +1166,15 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   /// 起一个 TCP 服务（交给库的 `TcpServer`）
   bool listenTcpServer(const std::shared_ptr<Server> &server, std::string &err);
 
+  /// 起一个 WebSocket 服务（交给库的 `HttpServer` + 任意路径升级）
+  bool listenWsServer(const std::shared_ptr<Server> &server, std::string &err);
+
+  /// 接受一条 WebSocket 连接（库的升级 handler 进来的地方）
+  asio::awaitable<void> onWsAccepted(
+      const std::shared_ptr<Server> &server,
+      utilxx::HttpServer::WsStream &ws,
+      const utilxx::HttpServer::Request &request);
+
   /// 接受一条 TCP 连接（库的 `TcpServer` 的 handler 进来的地方）
   asio::awaitable<void> onTcpAccepted(const std::shared_ptr<Server> &server,
                                       std::shared_ptr<utilxx::TcpConnection> conn);
@@ -1160,12 +1188,6 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
 
   /// 把静态路由同步给库的服务（文件走 `enableFileRoute`，内存内容在兑底里比对）
   void rebuildHttpFileRoutes(const Server &server);
-
-  void acceptNext(const std::shared_ptr<Server> &server);
-
-  /// 接受一条连接并创建对应的 Stream 实现
-  void onAccepted(const std::shared_ptr<Server> &server,
-                  asio::ip::tcp::socket socket);
 
   /// 关掉某个插件的全部服务与连接 (网络线程; 卸载 / 停机)
   ///
@@ -1278,11 +1300,6 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
 
 namespace {
 
-/// endpoint → `1.2.3.4:5678`
-std::string endpointText(const asio::ip::tcp::endpoint &endpoint) {
-  return endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
-}
-
 /// 连接 / 服务 id: 只允许字母数字与 . _ - (拼进事件与 info 里不会串味)
 bool isValidId(std::string_view id) {
   if (id.empty() || id.size() > 64) {
@@ -1320,24 +1337,6 @@ bool resolveBindHost(std::string &host, std::string &err) {
 /* ==================== Stream ==================== */
 
 Stream::Stream(std::shared_ptr<PluginNetHub::Impl> hubRef,
-               asio::ip::tcp::socket socketRef)
-    : hub(std::move(hubRef)) {
-  // 已连上的 socket 才有对端/本地地址 (客户端连接建立前是空的, 连上后再取一次)
-  if (socketRef.is_open()) {
-    AsioErrorCode ec;
-    const auto remoteEndpoint = socketRef.remote_endpoint(ec);
-    if (!ec) {
-      remote = endpointText(remoteEndpoint);
-    }
-    const auto localEndpoint = socketRef.local_endpoint(ec);
-    if (!ec) {
-      local = endpointText(localEndpoint);
-    }
-  }
-  io = std::make_shared<NetStream>(std::move(socketRef));
-}
-
-Stream::Stream(std::shared_ptr<PluginNetHub::Impl> hubRef,
                std::shared_ptr<utilxx::TcpConnection> connection)
     : hub(std::move(hubRef)), tcpConn(std::move(connection)) {
   // 库的连接已经建好, 对端 / 本地地址直接问它
@@ -1346,6 +1345,10 @@ Stream::Stream(std::shared_ptr<PluginNetHub::Impl> hubRef,
     local = tcpConn->localAddress();
   }
 }
+
+Stream::Stream(std::shared_ptr<PluginNetHub::Impl> hubRef,
+               std::shared_ptr<utilxx::WsClient> connection)
+    : hub(std::move(hubRef)), wsClient(std::move(connection)) {}
 
 void Stream::start() {
   readBuf.resize(kReadChunk);
@@ -1369,6 +1372,35 @@ void Stream::startRead() {
   }
   reading = true;
   auto self = shared_from_this();
+  if (wsClient) {
+    // 库的 WebSocket: 一条 recv 协程接一条（关闭帧与错误都在这里落地）
+    asio::co_spawn(
+        hub->io.get_executor(),
+        [self]() -> asio::awaitable<void> {
+          auto got = co_await self->wsClient->recv();
+          self->reading = false;
+          if (self->closing) {
+            co_return;
+          }
+          if (!got) {
+            self->closeStream("error", got.error());
+            co_return;
+          }
+          if (got->type == utilxx::WsMessage::Type::Close) {
+            // 对端先发关闭帧: 按正常关闭收尾，code / reason 交给 onClosed
+            self->closeStream("remote_closed", {});
+            co_return;
+          }
+          self->onWsMessage(got->type == utilxx::WsMessage::Type::Text,
+                            got->payload);
+          if (!self->closing) {
+            self->startRead();
+          }
+        },
+        asio::detached
+    );
+    return;
+  }
   if (tcpConn) {
     // 库的连接: 一次一条 recv 协程, 收完再排下一条（与暂停 / 关闭一致）
     asio::co_spawn(
@@ -1398,24 +1430,7 @@ void Stream::startRead() {
     );
     return;
   }
-  io->async_read_some(
-      asio::buffer(readBuf), [self](AsioErrorCode ec, size_t size) {
-        self->reading = false;
-        if (self->closing) {
-          return;
-        }
-        if (ec) {
-          const bool eof = NetStream::isPeerClosed(ec);
-          self->closeStream(eof ? "remote_closed" : "error", errorTextOf(ec));
-          return;
-        }
-        if (size > 0) {
-          self->onBytes(self->readBuf.data(), size);
-        }
-        if (!self->closing) {
-          self->startRead();
-        }
-      });
+  reading = false;
 }
 
 /// 暂停 / 恢复读 (网络线程调用; 暂停只影响 data 事件, 已收的字节照旧发出)
@@ -1436,7 +1451,21 @@ void Stream::send(std::string data, std::string &err) {
     return;
   }
   outBytes += data.size();
-  outQueue.push_back(std::move(data));
+  outQueue.push_back(OutItem{std::move(data), 0});
+  startWrite();
+}
+
+void Stream::sendWs(int32_t opcode, std::string data, std::string &err) {
+  if (closing || closeWhenFlushed) {
+    err = "closed";
+    return;
+  }
+  if (outBytes + data.size() > kMaxOutQueue) {
+    err = "queue_full";
+    return;
+  }
+  outBytes += data.size();
+  outQueue.push_back(OutItem{std::move(data), opcode});
   startWrite();
 }
 
@@ -1452,8 +1481,41 @@ void Stream::startWrite() {
   }
   writing = true;
   auto self = shared_from_this();
+  if (wsClient) {
+    OutItem item = std::move(outQueue.front());
+    outQueue.pop_front();
+    asio::co_spawn(
+        hub->io.get_executor(),
+        [self, item = std::move(item)]() -> asio::awaitable<void> {
+          std::expected<void, std::string> sent =
+              std::unexpected{std::string{"not open"}};
+          if (item.opcode == 2) {
+            sent = co_await self->wsClient->sendBinary(item.data);
+          } else if (item.opcode == 9) {
+            sent = co_await self->wsClient->sendPing(item.data);
+          } else {
+            sent = co_await self->wsClient->sendText(item.data);
+          }
+          self->writing = false;
+          self->outBytes -= item.data.size();
+          if (self->closing) {
+            co_return;
+          }
+          if (!sent) {
+            self->closeStream("error", sent.error());
+            co_return;
+          }
+          self->onWritten();
+          if (!self->closing) {
+            self->startWrite();
+          }
+        },
+        asio::detached
+    );
+    return;
+  }
   if (tcpConn) {
-    std::string chunk = std::move(outQueue.front());
+    std::string chunk = std::move(outQueue.front().data);
     outQueue.pop_front();
     asio::co_spawn(
         hub->io.get_executor(),
@@ -1477,8 +1539,6 @@ void Stream::startWrite() {
     );
     return;
   }
-  asio::async_write(*io, asio::buffer(outQueue.front()),
-                    [self](AsioErrorCode ec, size_t) { self->afterWrite(ec); });
 }
 
 void Stream::afterWrite(AsioErrorCode ec) {
@@ -1491,7 +1551,7 @@ void Stream::afterWrite(AsioErrorCode ec) {
     return;
   }
   if (!outQueue.empty()) {
-    outBytes -= outQueue.front().size();
+    outBytes -= outQueue.front().data.size();
     outQueue.pop_front();
   }
   onWritten();
@@ -1513,10 +1573,10 @@ void Stream::closeStream(std::string_view reason, std::string_view error) {
     return;
   }
   closing = true;
-  if (tcpConn) {
+  if (wsClient) {
+    wsClient->abort();
+  } else if (tcpConn) {
     tcpConn->abort();
-  } else if (io) {
-    io->close();
   }
   if (closedTimer) {
     closedTimer->cancel();
@@ -1625,46 +1685,12 @@ bool PluginNetHub::Impl::listenServer(std::shared_ptr<Server> server,
     // TCP 服务交给库（accept 与连接上限在库那边）
     return listenTcpServer(server, err);
   }
-  try {
-    asio::ip::tcp::endpoint endpoint{
-        asio::ip::make_address(server->host), server->port};
-    auto acceptor = std::make_shared<asio::ip::tcp::acceptor>(io);
-    acceptor->open(endpoint.protocol());
-    acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
-    acceptor->bind(endpoint);
-    acceptor->listen(asio::socket_base::max_listen_connections);
-    server->port = acceptor->local_endpoint().port();
-    server->acceptor = acceptor;
-    if (server->kind == "http" || server->kind == "ws") {
-      server->url = (server->kind == "http" ? "http://" : "ws://") +
-                    server->host + ":" + std::to_string(server->port) +
-                    server->pathPrefix;
-    }
-    servers[serverKeyOf(server->plugin, server->kind, server->id)] = server;
-    acceptNext(server);
-    return true;
-  } catch (const std::exception &e) {
-    err = osTextToUtf8(e.what());
-    return false;
+  if (server->kind == "ws") {
+    // WebSocket 服务交给库（升级、掩码、分片、ping/pong 与关闭握手在库那边）
+    return listenWsServer(server, err);
   }
-}
-
-void PluginNetHub::Impl::acceptNext(const std::shared_ptr<Server> &server) {
-  if (!server || !server->acceptor || !running.load(std::memory_order_acquire)) {
-    return;
-  }
-  if (!server->acceptor->is_open()) {
-    return; ///< 服务已关: 不再接受 (关监听后会回来一次 operation_aborted)
-  }
-  auto socket = std::make_shared<asio::ip::tcp::socket>(io);
-  auto self = shared_from_this();
-  server->acceptor->async_accept(*socket,
-                                 [self, server, socket](AsioErrorCode ec) {
-    if (!ec && socket->is_open()) {
-      self->onAccepted(server, std::move(*socket));
-    }
-    self->acceptNext(server);
-  });
+  err = "未知的服务类型: " + server->kind;
+  return false;
 }
 
 /* ==================== HTTP 静态内容 (文件 / 内存) ==================== */
@@ -2240,10 +2266,6 @@ void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
       }
       if (it->second->tcp) {
         it->second->tcp->stop();
-      }
-      if (it->second->acceptor) {
-        AsioErrorCode ignored;
-        it->second->acceptor->close(ignored);
       }
       it = servers.erase(it);
     } else {
@@ -2917,61 +2939,62 @@ asio::awaitable<void> PluginNetHub::Impl::onTcpAccepted(
 
 /* ==================== WebSocket ==================== */
 
+/// 一条 WebSocket 连接（客户端连上的，或服务端接受来的）
+///
+/// 握手、掩码、分片、ping/pong 与关闭握手都交给库的 `WsClient`（`wsConnect` /
+/// `wrapAcceptedWs`）；这里只负责插件面的事件与关闭语义。
 struct WsStream : Stream {
-  explicit WsStream(std::shared_ptr<PluginNetHub::Impl> hubRef,
-                    asio::ip::tcp::socket socketRef)
-      : Stream(std::move(hubRef), std::move(socketRef)) {}
+  explicit WsStream(std::shared_ptr<PluginNetHub::Impl> hubRef)
+      : Stream(std::move(hubRef), std::shared_ptr<utilxx::WsClient>{}) {}
 
+  std::shared_ptr<PluginNetHub::Impl::Server> server; ///< 服务端连接才有
   bool roleClient = true;
-  std::shared_ptr<PluginNetHub::Impl::Server> server;
 
-  // 客户端参数
+  // 客户端参数（由 ws.connect 填）
   std::string url;
-  std::string clientKey;
   Json extraHeaders = Json::object();
   std::vector<std::string> subprotocols;
   int32_t connectTimeoutMs = 8000;
   TlsClientOptions tlsOptions; ///< wss 时由 ws.connect 的参数填好
 
   // 双方共用
-  std::string subprotocol;
   int64_t maxMessage = kMaxWsMessage;
-  bool open = false;
-  bool closeSent = false;
-  std::string handshakeIn;
-  std::string in;
-  std::string messageAccum;
-  int32_t messageOpcode = 0;
   std::string closeBy; ///< remote / local / error / plugin_unloaded
   int32_t closeCode = 0;
   std::string closeReason;
 
-  std::unique_ptr<asio::ip::tcp::resolver> resolver;
-  std::unique_ptr<asio::steady_timer> timer;
-
   const char *kind() const override { return "ws"; }
 
-  /* ---------- 读 ---------- */
+  /// 客户端: 发起连接与握手（网络线程；成功后发 `ws.open`）
+  void startClient();
 
-  void onBytes(const char *data, size_t size) override {
-    if (!open) {
-      handshakeIn.append(data, size);
-      if (roleClient) {
-        handleClientHandshake();
-      } else {
-        handleServerHandshake();
-      }
-      return;
+  /// 服务端: 握手已完成，发 `ws.open` 并开始读
+  void startAccepted(const Json &handshakeHeaders, std::string_view path,
+                     std::string_view subprotocol);
+
+  /// 插件要求关闭（发关闭帧再收尾）
+  void closeByPlugin(int32_t code, std::string reason);
+
+  /// WebSocket 不经过字节流（消息由 [onWsMessage] 给出）
+  void onBytes(const char *, size_t) override {}
+
+  void onWsMessage(bool text, const std::string &payload) override {
+    Json event;
+    event["kind"] = "ws.message";
+    event["id"] = id;
+    if (!serverId.empty()) {
+      event["serverId"] = serverId;
     }
-    in.append(data, size);
-    drainFrames();
+    event["binary"] = !text;
+    event["dataBase64"] = utilxx_base::base64Encode(payload);
+    if (text || isValidUtf8(payload)) {
+      event["text"] = toSafeText(payload);
+    }
+    event["bytes"] = static_cast<int64_t>(payload.size());
+    hub->emit(plugin, std::move(event));
   }
 
   void onClosed(std::string_view reason, std::string_view error) override {
-    if (timer) {
-      AsioErrorCode ignored;
-      timer->cancel();
-    }
     Json event;
     event["kind"] = "ws.close";
     event["id"] = id;
@@ -3003,550 +3026,221 @@ struct WsStream : Stream {
     hub->emit(plugin, std::move(event));
   }
 
-  /* ---------- 客户端: 连接 + 握手 ---------- */
-
-  void startClient() {
-    ParsedUrl target = parseUrl(url);
-    if (!target.ok) {
-      closeBy = "error";
-      closeStream("error", target.error);
-      return;
-    }
-    const bool secure = target.scheme == "wss";
-    if (target.scheme != "ws" && !secure) {
-      closeBy = "error";
-      closeStream("error", "WebSocket 地址只支持 ws:// 或 wss://");
-      return;
-    }
-    tlsOptions.enable = secure;
-    tlsOptions.host = target.host;
-    armTimer(connectTimeoutMs);
-    resolver = std::make_unique<asio::ip::tcp::resolver>(hub->io);
-    auto self = std::static_pointer_cast<WsStream>(shared_from_this());
-    resolver->async_resolve(
-        target.host, std::to_string(target.port),
-        [self, target](AsioErrorCode ec,
-                       asio::ip::tcp::resolver::results_type results) {
-          if (ec) {
-            self->closeBy = "error";
-            self->closeStream("connect_failed", "解析失败: " + errorTextOf(ec));
-            return;
-          }
-          asio::async_connect(
-              self->io->lowest_layer(), results,
-              [self, target](AsioErrorCode connectEc,
-                             const asio::ip::tcp::endpoint &) {
-                if (connectEc) {
-                  self->closeBy = "error";
-                  self->closeStream("connect_failed",
-                                    "连接失败: " + errorTextOf(connectEc));
-                  return;
-                }
-                AsioErrorCode ignored;
-                self->remote = endpointText(
-                    self->io->lowest_layer().remote_endpoint(ignored));
-                self->local = endpointText(
-                    self->io->lowest_layer().local_endpoint(ignored));
-                if (!self->tlsOptions.enable) {
-                  self->sendClientHandshake(target);
-                  return;
-                }
-                // wss: 先完成 TLS 握手, 再在上面跑 WebSocket 握手
-                self->io->asyncStartTls(
-                    self->tlsOptions,
-                    [self, target](AsioErrorCode tlsEc, std::string code,
-                                   std::string message) {
-                      if (self->closing) {
-                        return;
-                      }
-                      if (tlsEc) {
-                        self->closeBy = "error";
-                        self->closeStream(code.empty() ? "tls_failed" : code,
-                                          message);
-                        return;
-                      }
-                      self->sendClientHandshake(target);
-                    });
-              });
-        });
-  }
-
-  void sendClientHandshake(const ParsedUrl &target) {
-    clientKey = wsClientKey();
-    std::string request = "GET " + target.target + " HTTP/1.1\r\n";
-    request += "Host: " + hostHeaderOf(target) + "\r\n";
-    request += "Upgrade: websocket\r\n";
-    request += "Connection: Upgrade\r\n";
-    request += "Sec-WebSocket-Key: " + clientKey + "\r\n";
-    request += "Sec-WebSocket-Version: 13\r\n";
-    if (!subprotocols.empty()) {
-      request += "Sec-WebSocket-Protocol: ";
-      for (size_t i = 0; i < subprotocols.size(); ++i) {
-        if (i > 0) {
-          request += ", ";
-        }
-        request += subprotocols[i];
-      }
-      request += "\r\n";
-    }
-    if (extraHeaders.is_object()) {
-      for (const auto &item : extraHeaders.items()) {
-        const std::string name{item.first};
-        if (iequals(name, "host") || iequals(name, "upgrade") ||
-            iequals(name, "connection") || iequals(name, "sec-websocket-key") ||
-            iequals(name, "sec-websocket-version") ||
-            iequals(name, "sec-websocket-protocol")) {
-          continue;
-        }
-        request += name + ": " + toSafeText(jsonTextOf(item.second)) + "\r\n";
-      }
-    }
-    request += "\r\n";
-    armTimer(connectTimeoutMs);
-    std::string err;
-    send(std::move(request), err);
-    if (!err.empty()) {
-      closeBy = "error";
-      closeStream("error", err);
-      return;
-    }
-    start(); ///< 读循环 (等 101)
-  }
-
-  void handleClientHandshake() {
-    const size_t headEnd = handshakeIn.find("\r\n\r\n");
-    if (headEnd == std::string::npos) {
-      if (handshakeIn.size() > kMaxHeadBytes) {
-        failHandshake("握手响应头过大");
-      }
-      return;
-    }
-    HttpHead head;
-    const std::string headText = handshakeIn.substr(0, headEnd);
-    handshakeIn.erase(0, headEnd + 4);
-    if (!parseHttpHead(headText, false, head) || head.status != 101) {
-      failHandshake("握手被拒绝 (状态 " + std::to_string(head.status) + ")");
-      return;
-    }
-    const std::string accept = head.header("sec-websocket-accept");
-    if (accept != wsAcceptKey(clientKey)) {
-      failHandshake("Sec-WebSocket-Accept 不匹配");
-      return;
-    }
-    subprotocol = head.header("sec-websocket-protocol");
-    open = true;
-    if (timer) {
-      AsioErrorCode ignored;
-      timer->cancel();
-    }
-    Json event;
-    event["kind"] = "ws.open";
-    event["id"] = id;
-    event["url"] = url;
-    event["remote"] = remote;
-    event["headers"] = head.headersJson();
-    if (!subprotocol.empty()) {
-      event["subprotocol"] = subprotocol;
-    }
+  /// 发 `ws.open` 并开始读（客户端与服务端共用）
+  void emitOpen(Json event) {
     hub->emit(plugin, std::move(event));
-    if (!handshakeIn.empty()) {
-      in = std::move(handshakeIn);
-      handshakeIn.clear();
-      drainFrames();
-    }
-  }
-
-  /* ---------- 服务端: 握手 ---------- */
-
-  void handleServerHandshake() {
-    const size_t headEnd = handshakeIn.find("\r\n\r\n");
-    if (headEnd == std::string::npos) {
-      if (handshakeIn.size() > kMaxHeadBytes) {
-        failHandshake("握手请求头过大");
-      }
-      return;
-    }
-    HttpHead head;
-    const std::string headText = handshakeIn.substr(0, headEnd);
-    handshakeIn.erase(0, headEnd + 4);
-    if (!parseHttpHead(headText, true, head)) {
-      failHandshake("握手请求头解析失败");
-      return;
-    }
-    const std::string key = head.header("sec-websocket-key");
-    const std::string upgrade = lowerAscii(head.header("upgrade"));
-    const std::string connection = lowerAscii(head.header("connection"));
-    if (key.empty() || upgrade.find("websocket") == std::string::npos ||
-        connection.find("upgrade") == std::string::npos) {
-      failHandshake("不是合法的 WebSocket 握手");
-      return;
-    }
-    std::string path;
-    std::string query;
-    splitTarget(head.target, path, query);
-    if (server && !server->pathPrefix.empty() &&
-        !startsWith(path, server->pathPrefix)) {
-      std::string err;
-      send("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-           err);
-      closeBy = "error";
-      closeStream("handshake_rejected", "路径不匹配");
-      return;
-    }
-    std::string response =
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-        "Connection: Upgrade\r\nSec-WebSocket-Accept: " +
-        wsAcceptKey(key) + "\r\n";
-    const std::string wanted = head.header("sec-websocket-protocol");
-    if (!wanted.empty()) {
-      // 服务端不声明子协议: 原样回第一个是常见做法, 但更安全的是不回
-      // (客户端会按"没选"处理); 这里保持不回。
-    }
-    response += "\r\n";
-    std::string err;
-    send(std::move(response), err);
-    if (!err.empty()) {
-      closeBy = "error";
-      closeStream("error", err);
-      return;
-    }
-    open = true;
-    Json event;
-    event["kind"] = "ws.open";
-    event["id"] = id;
-    if (!serverId.empty()) {
-      event["serverId"] = serverId;
-    }
-    event["path"] = toSafeText(path);
-    event["query"] = toSafeText(query);
-    event["remote"] = remote;
-    event["headers"] = head.headersJson();
-    hub->emit(plugin, std::move(event));
-    if (!handshakeIn.empty()) {
-      in = std::move(handshakeIn);
-      handshakeIn.clear();
-      drainFrames();
-    }
-  }
-
-  void failHandshake(std::string_view message) {
-    closeBy = "error";
-    // 服务端: 给对端一个可读的拒绝响应 (客户端: 直接关)
-    if (!roleClient && !closing) {
-      std::string err;
-      send("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-           err);
-    }
-    closeStream("handshake_failed", message);
-  }
-
-  void armTimer(int32_t timeoutMs) {
-    if (!timer) {
-      timer = std::make_unique<asio::steady_timer>(hub->io);
-    }
-    AsioErrorCode ignored;
-    timer->cancel();
-    timer->expires_after(
-        std::chrono::milliseconds{(std::max)(timeoutMs, 1000)});
-    auto self = std::static_pointer_cast<WsStream>(shared_from_this());
-    timer->async_wait([self](AsioErrorCode ec) {
-      if (!ec && !self->open) {
-        self->closeBy = "error";
-        self->closeStream("timeout", "握手超时");
-      }
-    });
-  }
-
-  /* ---------- 帧 ---------- */
-
-  void drainFrames() {
-    while (open && !closing) {
-      if (in.size() < 2) {
-        return;
-      }
-      const auto b0 = static_cast<unsigned char>(in[0]);
-      const auto b1 = static_cast<unsigned char>(in[1]);
-      const bool fin = (b0 & 0x80) != 0;
-      const int32_t opcode = b0 & 0x0F;
-      const bool masked = (b1 & 0x80) != 0;
-      if ((b0 & 0x70) != 0) {
-        protocolError(1002, "保留位不为 0");
-        return;
-      }
-      uint64_t length = b1 & 0x7F;
-      size_t offset = 2;
-      if (length == 126) {
-        if (in.size() < 4) {
-          return;
-        }
-        length = (static_cast<uint64_t>(static_cast<unsigned char>(in[2])) << 8) |
-                 static_cast<unsigned char>(in[3]);
-        offset = 4;
-      } else if (length == 127) {
-        if (in.size() < 10) {
-          return;
-        }
-        uint64_t value = 0;
-        for (size_t i = 2; i < 10; ++i) {
-          value = (value << 8) | static_cast<unsigned char>(in[i]);
-        }
-        if ((value & 0x8000000000000000ull) != 0) {
-          protocolError(1002, "帧长度最高位为 1");
-          return;
-        }
-        length = value;
-        offset = 10;
-      }
-      if (length > static_cast<uint64_t>(maxMessage)) {
-        protocolError(1009, "消息超过上限");
-        return;
-      }
-      if (!roleClient && !masked) {
-        protocolError(1002, "客户端发来的帧必须带掩码");
-        return;
-      }
-      if (roleClient && masked) {
-        protocolError(1002, "服务端发来的帧不能带掩码");
-        return;
-      }
-      const size_t maskLength = masked ? 4 : 0;
-      if (in.size() < offset + maskLength + length) {
-        return;
-      }
-      std::string payload = in.substr(offset + maskLength, length);
-      if (masked) {
-        const unsigned char *mask =
-            reinterpret_cast<const unsigned char *>(in.data() + offset);
-        for (size_t i = 0; i < payload.size(); ++i) {
-          payload[i] = static_cast<char>(
-              static_cast<unsigned char>(payload[i]) ^ mask[i % 4]);
-        }
-      }
-      in.erase(0, offset + maskLength + length);
-      handleFrame(fin, opcode, std::move(payload));
-    }
-  }
-
-  void handleFrame(bool fin, int32_t opcode, std::string payload) {
-    switch (opcode) {
-    case 0x0: { // 分片续帧
-      if (messageOpcode == 0) {
-        protocolError(1002, "没有开始的分片");
-        return;
-      }
-      appendFragment(std::move(payload), fin);
-      return;
-    }
-    case 0x1:
-    case 0x2: { // 文本 / 二进制
-      if (messageOpcode != 0) {
-        protocolError(1002, "上一条分片消息还没结束");
-        return;
-      }
-      if (!fin) {
-        messageOpcode = opcode;
-        messageAccum = std::move(payload);
-        if (static_cast<int64_t>(messageAccum.size()) > maxMessage) {
-          protocolError(1009, "消息超过上限");
-        }
-        return;
-      }
-      deliverMessage(opcode, payload);
-      return;
-    }
-    case 0x8:
-      handleCloseFrame(payload);
-      return;
-    case 0x9: { // ping → pong
-      std::string err;
-      sendFrame(0xA, payload, err);
-      return;
-    }
-    case 0xA: { // pong
-      Json event;
-      event["kind"] = "ws.pong";
-      event["id"] = id;
-      if (!serverId.empty()) {
-        event["serverId"] = serverId;
-      }
-      event["bytes"] = static_cast<int64_t>(payload.size());
-      hub->emit(plugin, std::move(event));
-      return;
-    }
-    default:
-      protocolError(1002, "未知帧类型");
-      return;
-    }
-  }
-
-  void appendFragment(std::string payload, bool fin) {
-    messageAccum += payload;
-    if (static_cast<int64_t>(messageAccum.size()) > maxMessage) {
-      protocolError(1009, "消息超过上限");
-      return;
-    }
-    if (fin) {
-      const int32_t opcode = messageOpcode;
-      std::string full = std::move(messageAccum);
-      messageOpcode = 0;
-      messageAccum.clear();
-      deliverMessage(opcode, full);
-    }
-  }
-
-  void deliverMessage(int32_t opcode, const std::string &payload) {
-    Json event;
-    event["kind"] = "ws.message";
-    event["id"] = id;
-    if (!serverId.empty()) {
-      event["serverId"] = serverId;
-    }
-    event["binary"] = opcode == 0x2;
-    event["dataBase64"] = utilxx_base::base64Encode(payload);
-    if (opcode == 0x1) {
-      event["text"] = payload;
-    }
-    event["bytes"] = static_cast<int64_t>(payload.size());
-    hub->emit(plugin, std::move(event));
-  }
-
-  void handleCloseFrame(const std::string &payload) {
-    closeBy = "remote";
-    if (payload.size() >= 2) {
-      closeCode = (static_cast<unsigned char>(payload[0]) << 8) |
-                  static_cast<unsigned char>(payload[1]);
-      closeReason = payload.substr(2);
-    } else {
-      closeCode = 1005; ///< 没有状态码
-    }
-    if (!closeSent) {
-      std::string echo;
-      if (payload.size() >= 2) {
-        echo = payload.substr(0, 2);
-      }
-      std::string err;
-      sendFrame(0x8, echo, err);
-      closeSent = true;
-    }
-    flushThenClose();
-  }
-
-  void protocolError(int32_t code, std::string_view message) {
-    closeBy = "error";
-    if (!closeSent) {
-      std::string err;
-      sendFrame(0x8, closePayload(code, std::string{message}), err);
-      closeSent = true;
-    }
-    closeStream("protocol_error", message);
-  }
-
-  static std::string closePayload(int32_t code, const std::string &reason) {
-    std::string payload;
-    payload.push_back(static_cast<char>((code >> 8) & 0xFF));
-    payload.push_back(static_cast<char>(code & 0xFF));
-    payload += reason.substr(0, 120);
-    return payload;
-  }
-
-  void sendFrame(int32_t opcode, std::string_view payload, std::string &err) {
-    if (!open || closing) {
-      err = "not_open";
-      return;
-    }
-    std::string frame;
-    frame.reserve(payload.size() + 14);
-    frame.push_back(static_cast<char>(0x80 | (opcode & 0x0F)));
-    const bool mask = roleClient;
-    const uint64_t size = payload.size();
-    if (size < 126) {
-      frame.push_back(static_cast<char>((mask ? 0x80 : 0x00) | size));
-    } else if (size <= 0xFFFF) {
-      frame.push_back(static_cast<char>((mask ? 0x80 : 0x00) | 126));
-      frame.push_back(static_cast<char>((size >> 8) & 0xFF));
-      frame.push_back(static_cast<char>(size & 0xFF));
-    } else {
-      frame.push_back(static_cast<char>((mask ? 0x80 : 0x00) | 127));
-      for (int i = 7; i >= 0; --i) {
-        frame.push_back(static_cast<char>((size >> (8 * i)) & 0xFF));
-      }
-    }
-    if (mask) {
-      const auto key = randomBytes(4);
-      frame.append(reinterpret_cast<const char *>(key.data()), 4);
-      const size_t start = frame.size();
-      frame.append(payload);
-      for (size_t i = 0; i < size; ++i) {
-        frame[start + i] = static_cast<char>(
-            static_cast<unsigned char>(frame[start + i]) ^ key[i % 4]);
-      }
-    } else {
-      frame.append(payload);
-    }
-    send(std::move(frame), err);
-  }
-
-  /// 插件主动关闭 (`ws.close` / `socket.close`)
-  void closeByPlugin(int32_t code, const std::string &reason) {
-    if (closeBy.empty()) {
-      closeBy = "local";
-    }
-    closeCode = code;
-    closeReason = reason;
-    if (!closeSent && open) {
-      std::string err;
-      sendFrame(0x8, closePayload(code, reason), err);
-      closeSent = true;
-    }
-    flushThenClose();
+    start();
   }
 };
 
-/* ==================== 接受连接 (需要各种 Stream 已定义) ==================== */
+void WsStream::startClient() {
+  auto self = std::static_pointer_cast<WsStream>(shared_from_this());
+  utilxx::WsClientConfig config;
+  config.connectTimeout =
+      std::chrono::milliseconds{(std::max)(connectTimeoutMs, 1000)};
+  // 长连接: 读空闲不算错（给一个远期上限，避免 0 被当成立即超时）
+  config.recvTimeout = std::chrono::hours{24 * 365};
+  config.sendTimeout = std::chrono::seconds{60};
+  config.maxMessageSize =
+      static_cast<size_t>((std::max)(int64_t{1024}, maxMessage));
+  config.sslVerify = tlsOptions.verify;
+  config.sslVerifyHost = tlsOptions.verify;
+  config.sslServerName = tlsOptions.serverName;
+  if (!tlsOptions.caFile.empty() || !tlsOptions.caPem.empty()) {
+    std::string tlsError;
+    config.sslContext = tlsClientContext(tlsOptions, tlsError);
+    if (!config.sslContext) {
+      closeBy = "error";
+      closeStream("tls_config", tlsError.empty() ? "TLS 配置不可用" : tlsError);
+      return;
+    }
+  }
+  std::vector<std::pair<std::string, std::string>> headers;
+  if (extraHeaders.is_object()) {
+    for (const auto &item : extraHeaders.items()) {
+      headers.emplace_back(item.first, toSafeText(jsonTextOf(item.second)));
+    }
+  }
+  if (!subprotocols.empty()) {
+    std::string joined;
+    for (const auto &item : subprotocols) {
+      if (!joined.empty()) {
+        joined += ", ";
+      }
+      joined += item;
+    }
+    headers.emplace_back("Sec-WebSocket-Protocol", joined);
+  }
+  const std::string reportSubprotocol =
+      subprotocols.empty() ? std::string{} : subprotocols.front();
+  auto executor = hub->io.get_executor();
+  const std::string targetUrl = url;
+  asio::co_spawn(
+      executor,
+      [self, executor, targetUrl, headers, config, reportSubprotocol]()
+          -> asio::awaitable<void> {
+        std::expected<std::unique_ptr<utilxx::WsClient>, std::string> connected =
+            std::unexpected{std::string{"connect failed"}};
+        try {
+          connected =
+              co_await utilxx::wsConnect(executor, targetUrl, headers, config);
+        } catch (const std::exception &e) {
+          connected = std::unexpected{std::string{e.what()}};
+        } catch (...) {
+          connected = std::unexpected{std::string{"connect failed"}};
+        }
+        if (self->closing) {
+          co_return;
+        }
+        if (!connected) {
+          self->closeBy = "error";
+          self->closeStream("connect_failed", connected.error());
+          co_return;
+        }
+        self->wsClient = std::shared_ptr<utilxx::WsClient>(std::move(*connected));
+        Json event;
+        event["kind"] = "ws.open";
+        event["id"] = self->id;
+        event["url"] = targetUrl;
+        if (!reportSubprotocol.empty()) {
+          event["subprotocol"] = reportSubprotocol;
+        }
+        event["remote"] = self->remote;
+        event["local"] = self->local;
+        self->emitOpen(std::move(event));
+      },
+      asio::detached
+  );
+}
 
-void PluginNetHub::Impl::onAccepted(const std::shared_ptr<Server> &server,
-                                    asio::ip::tcp::socket socket) {
-  if (!server || server->conns.size() >=
-                     static_cast<size_t>(server->maxConnections) ||
+void WsStream::startAccepted(const Json &handshakeHeaders,
+                             std::string_view path,
+                             std::string_view subprotocol) {
+  Json event;
+  event["kind"] = "ws.open";
+  event["id"] = id;
+  event["serverId"] = serverId;
+  event["path"] = toSafeText(path);
+  event["headers"] = handshakeHeaders;
+  if (!subprotocol.empty()) {
+    event["subprotocol"] = toSafeText(subprotocol);
+  }
+  event["remote"] = remote;
+  event["local"] = local;
+  emitOpen(std::move(event));
+}
+
+void WsStream::closeByPlugin(int32_t code, std::string reason) {
+  const int32_t wanted = code <= 0 ? 1000 : code;
+  if (!wsClient) {
+    closeBy = "local";
+    closeStream("local_close", {});
+    return;
+  }
+  auto self = std::static_pointer_cast<WsStream>(shared_from_this());
+  auto executor = hub->io.get_executor();
+  asio::co_spawn(
+      executor,
+      [self, wanted, reason = std::move(reason)]() -> asio::awaitable<void> {
+        co_await self->wsClient->sendClose(static_cast<uint16_t>(wanted),
+                                           reason);
+        if (self->closing) {
+          co_return;
+        }
+        self->closeBy = "local";
+        self->closeCode = wanted;
+        self->closeReason = reason;
+        self->closeStream("local_close", {});
+      },
+      asio::detached
+  );
+}
+
+/* ==================== WebSocket 服务（交给库的 HttpServer） ==================== */
+
+bool PluginNetHub::Impl::listenWsServer(const std::shared_ptr<Server> &server,
+                                        std::string &err) {
+  utilxx::HttpServer::Config config;
+  config.address = server->host;
+  config.port = server->port;
+  config.requestTimeout = std::chrono::seconds{30};
+  config.maxConnections =
+      static_cast<size_t>((std::max)(int32_t{1}, server->maxConnections));
+  config.accessLogEnabled = false;
+  auto http = std::make_shared<utilxx::HttpServer>(config);
+  auto self = shared_from_this();
+  // 插件的 `path` 是前缀（空 = 任意路径），所以用“任意路径升级”再自己判前缀
+  http->enableWebSocketAny(
+      [self, server](utilxx::HttpServer::WsStream &ws,
+                     const utilxx::HttpServer::Request &request)
+          -> asio::awaitable<void> {
+        co_await self->onWsAccepted(server, ws, request);
+      });
+  try {
+    http->startAsync(io.get_executor());
+  } catch (const std::exception &e) {
+    err = osTextToUtf8(e.what());
+    return false;
+  }
+  server->http = http;
+  server->port = http->port();
+  server->url = "ws://" + server->host + ":" + std::to_string(server->port) +
+                server->pathPrefix;
+  servers[serverKeyOf(server->plugin, server->kind, server->id)] = server;
+  return true;
+}
+
+asio::awaitable<void> PluginNetHub::Impl::onWsAccepted(
+    const std::shared_ptr<Server> &server, utilxx::HttpServer::WsStream &ws,
+    const utilxx::HttpServer::Request &request) {
+  auto self = shared_from_this();
+  const std::string path{requestPath(request.target())};
+  // 路径前缀不匹配: 直接返回（升级后的流随 handler 结束一起关）
+  if (!server->pathPrefix.empty() && !startsWith(path, server->pathPrefix)) {
+    co_return;
+  }
+  if (server->conns.size() >= static_cast<size_t>(server->maxConnections) ||
       connectionCountOf(server->plugin) >= kMaxConnectionsPerPlugin) {
-    AsioErrorCode ignored;
-    socket.close(ignored);
-    return;
+    co_return;
   }
+  utilxx::WsClientConfig config;
+  // 长连接: 读空闲不算错（给一个远期上限）
+  config.recvTimeout = std::chrono::hours{24 * 365};
+  config.sendTimeout = std::chrono::seconds{60};
+  config.maxMessageSize = static_cast<size_t>(kMaxWsMessage);
+  auto client = utilxx::wrapAcceptedWs(io.get_executor(), std::move(ws), config);
   const int64_t seq = nextConnSeq.fetch_add(1, std::memory_order_relaxed);
-  const std::string connId = server->id + "#" + std::to_string(seq);
-
-  std::shared_ptr<Stream> stream;
-  if (server->kind == "ws") {
-    auto ws = std::make_shared<WsStream>(shared_from_this(), std::move(socket));
-    ws->server = server;
-    ws->roleClient = false;
-    // 握手要有上界: 连上不发 (或发坏的) 握手不能一直占着连接
-    ws->armTimer(10000);
-    stream = ws;
-  } else {
-    // 其它类型（tcp 现在走库的 TcpServer，不会进到这里）: 直接关掉
-    AsioErrorCode ignored;
-    socket.close(ignored);
-    return;
-  }
+  auto stream = std::make_shared<WsStream>(self);
+  stream->wsClient = std::shared_ptr<utilxx::WsClient>(std::move(client));
   stream->plugin = server->plugin;
   stream->serverId = server->id;
-  stream->id = connId;
+  stream->id = server->id + "#" + std::to_string(seq);
+  stream->server = server;
+  stream->roleClient = false;
   if (!registerStream(stream)) {
-    stream->io->close();
-    return;
+    stream->closeStream("error", "too_many");
+    co_return;
   }
-  if (auto tcp = std::dynamic_pointer_cast<TcpStream>(stream)) {
-    Json event;
-    event["kind"] = "socket.accepted";
-    event["serverId"] = server->id;
-    event["id"] = stream->id;
-    event["remote"] = stream->remote;
-    event["local"] = stream->local;
-    emit(server->plugin, std::move(event));
+  Json headers = Json::object();
+  for (const auto &field : request) {
+    headers[lowerAscii(toSafeText(field.name_string()))] =
+        toSafeText(field.value());
   }
-  stream->start();
+  // 客户端要约的子协议取第一个（框架不会自己选）
+  std::string subprotocol;
+  const auto protocolField =
+      request[boost::beast::http::field::sec_websocket_protocol];
+  if (!protocolField.empty()) {
+    std::string_view text{protocolField.data(), protocolField.size()};
+    const auto comma = text.find(',');
+    subprotocol = std::string{comma == std::string_view::npos
+                                  ? text
+                                  : text.substr(0, comma)};
+    subprotocol = std::string{trimAscii(subprotocol)};
+  }
+  stream->startAccepted(headers, path, subprotocol);
+  // 这条协程就是连接的生命周期: 连接关掉（或服务停止）才返回
+  co_await stream->waitClosed();
 }
 
 /* ==================== UDP 通道 ==================== */
@@ -4011,10 +3705,6 @@ void PluginNetHub::Impl::stopServers(const std::string &plugin,
     if (server->tcp) {
       server->tcp->stop();
     }
-    if (server->acceptor) {
-      AsioErrorCode ignored;
-      server->acceptor->close(ignored);
-    }
     std::vector<std::string> connIds(server->conns.begin(), server->conns.end());
     for (const auto &connId : connIds) {
       const auto stream = findConn(plugin, connId);
@@ -4201,7 +3891,7 @@ std::string PluginNetHub::Impl::infoJsonOnThread(const std::string &plugin,
     }
     row["remote"] = stream->remote;
     row["local"] = stream->local;
-    row["secure"] = stream->io && stream->io->usingTls();
+    row["secure"] = false;
     row["queuedBytes"] = static_cast<int64_t>(stream->outBytes);
     connsJson.push_back(std::move(row));
   }
@@ -4557,8 +4247,7 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
       out = errorJson("exists", "同名的连接已经存在");
       return PLUGINXX_NET_OK;
     }
-    auto ws = std::make_shared<WsStream>(shared_from_this(),
-                                         asio::ip::tcp::socket(io));
+    auto ws = std::make_shared<WsStream>(shared_from_this());
     ws->plugin = plugin;
     ws->id = id;
     ws->roleClient = true;
@@ -4677,7 +4366,7 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
       }
     }
     std::string err;
-    ws->sendFrame(opcode, payload, err);
+    ws->sendWs(opcode, payload, err);
     if (!err.empty()) {
       out = errorJson(err, "发送失败 (连接可能还没握手完成)");
       return PLUGINXX_NET_OK;
@@ -4696,7 +4385,7 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
       return PLUGINXX_NET_OK;
     }
     std::string err;
-    ws->sendFrame(0x9, args.value("text", std::string{}), err);
+    ws->sendWs(9, args.value("text", std::string{}), err);
     out = err.empty() ? Json::object() : errorJson(err, "发送失败");
     out["ok"] = err.empty();
     return PLUGINXX_NET_OK;

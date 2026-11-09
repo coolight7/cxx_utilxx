@@ -286,6 +286,14 @@ void HttpServer::setFallbackHandler(FallbackHandler handler) {
     fallback_ = std::make_shared<FallbackHandler>(std::move(handler));
 }
 
+void HttpServer::enableWebSocketAny(WsRequestHandler handler) {
+    if (!handler) {
+        wsAny_.reset();
+        return;
+    }
+    wsAny_ = std::make_shared<WsRequestHandler>(std::move(handler));
+}
+
 void HttpServer::startAsync(asio::any_io_executor executor) {
     if (stopped_) {
         return;

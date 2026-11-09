@@ -50,6 +50,17 @@ struct WsClientConfig {
     std::chrono::milliseconds sendTimeout    = std::chrono::seconds{60};
     bool                      sslVerify      = false;
     size_t                    maxMessageSize = 16 * 1024 * 1024;
+
+    /// 本次连接专用的 TLS 上下文（为空 = 用进程共享的那个）
+    ///
+    /// 用处：插件网络要把“额外信任的 CA”传进来，而共享上下文不能按连接改。
+    std::shared_ptr<asio::ssl::context> sslContext;
+
+    /// 是否校验证书里的主机名（默认关闭，沿用库以前只校链的行为）
+    bool sslVerifyHost = false;
+
+    /// 覆盖 SNI 与主机名校验用的名字（为空 = 用 URL 里的主机名）
+    std::string sslServerName;
 };
 
 /// WebSocket 客户端
