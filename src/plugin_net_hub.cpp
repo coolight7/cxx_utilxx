@@ -16,6 +16,7 @@
 
 #include "utilxx/http_client.h"
 #include "utilxx/http_server.h"
+#include "utilxx/tcp.h"
 #include "utilxx/udp.h"
 
 
@@ -29,6 +30,7 @@
 #include <asio/cancellation_signal.hpp>
 #include <asio/connect.hpp>
 #include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
 #include <asio/error.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/address.hpp>
@@ -923,6 +925,10 @@ struct SyncSlot {
 /// 一条 TCP 连接 (客户端或服务端接受的那一端)
 struct Stream : std::enable_shared_from_this<Stream> {
   Stream(std::shared_ptr<PluginNetHub::Impl> hub, asio::ip::tcp::socket socket);
+
+  /// 接管库的一条 TCP 连接（发送队列、暂停、事件与 NetStream 那条路一致）
+  Stream(std::shared_ptr<PluginNetHub::Impl> hub,
+         std::shared_ptr<utilxx::TcpConnection> connection);
   virtual ~Stream() = default;
 
   std::shared_ptr<PluginNetHub::Impl> hub;
@@ -934,6 +940,8 @@ struct Stream : std::enable_shared_from_this<Stream> {
 
   /// 连接的读写层: 纯 TCP 或客户端 TLS (建好之后所有读写都经过它)
   std::shared_ptr<NetStream> io;
+  /// 走库的 `TcpConnection` 时非空（与 `io` 二选一）
+  std::shared_ptr<utilxx::TcpConnection> tcpConn;
   std::vector<char> readBuf;
   std::deque<std::string> outQueue;
   size_t outBytes = 0;
@@ -944,6 +952,11 @@ struct Stream : std::enable_shared_from_this<Stream> {
   bool paused = false;
   /// 是否已经有一个读在飞 (暂停/恢复靠它判断要不要重新排读)
   bool reading = false;
+  /// `waitClosed()` 的等待点（关掉连接时取消）
+  std::shared_ptr<asio::steady_timer> closedTimer;
+
+  /// 等这条连接关掉（服务端的 accept 协程靠它挂到连接结束）
+  asio::awaitable<void> waitClosed();
 
   void start();
   void startRead();
@@ -1032,6 +1045,8 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
     std::vector<std::shared_ptr<StaticRoute>> routes;
     /// HTTP 服务实例（kind == "http" 时由库提供服务；tcp / ws 还是自己 accept）
     std::shared_ptr<utilxx::HttpServer> http;
+    /// TCP 服务实例（kind == "tcp" 时由库 accept）
+    std::shared_ptr<utilxx::TcpServer> tcp;
   };
 
   std::map<std::string, std::shared_ptr<Server>> servers; ///< plugin|kind|id
@@ -1128,6 +1143,13 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   /// 起一个 HTTP 服务（交给库的 `HttpServer`，不自建 accept 循环）
   bool listenHttpServer(const std::shared_ptr<Server> &server,
                         std::string &err);
+
+  /// 起一个 TCP 服务（交给库的 `TcpServer`）
+  bool listenTcpServer(const std::shared_ptr<Server> &server, std::string &err);
+
+  /// 接受一条 TCP 连接（库的 `TcpServer` 的 handler 进来的地方）
+  asio::awaitable<void> onTcpAccepted(const std::shared_ptr<Server> &server,
+                                      std::shared_ptr<utilxx::TcpConnection> conn);
 
   /// 一条 HTTP 请求的兑底处理：静态内存路由 -> 插件回答 -> 504
   asio::awaitable<void> handleHttpRequest(
@@ -1315,9 +1337,30 @@ Stream::Stream(std::shared_ptr<PluginNetHub::Impl> hubRef,
   io = std::make_shared<NetStream>(std::move(socketRef));
 }
 
+Stream::Stream(std::shared_ptr<PluginNetHub::Impl> hubRef,
+               std::shared_ptr<utilxx::TcpConnection> connection)
+    : hub(std::move(hubRef)), tcpConn(std::move(connection)) {
+  // 库的连接已经建好, 对端 / 本地地址直接问它
+  if (tcpConn) {
+    remote = tcpConn->peerAddress();
+    local = tcpConn->localAddress();
+  }
+}
+
 void Stream::start() {
   readBuf.resize(kReadChunk);
   startRead();
+}
+
+asio::awaitable<void> Stream::waitClosed() {
+  if (closing) {
+    co_return;
+  }
+  closedTimer = std::make_shared<asio::steady_timer>(hub->io);
+  // 一个远期的到期点: 关掉连接时取消它, 等的人就醒
+  closedTimer->expires_after(std::chrono::hours{24 * 365});
+  AsioErrorCode ec;
+  co_await closedTimer->async_wait(asio::redirect_error(asio::use_awaitable, ec));
 }
 
 void Stream::startRead() {
@@ -1326,6 +1369,35 @@ void Stream::startRead() {
   }
   reading = true;
   auto self = shared_from_this();
+  if (tcpConn) {
+    // 库的连接: 一次一条 recv 协程, 收完再排下一条（与暂停 / 关闭一致）
+    asio::co_spawn(
+        hub->io.get_executor(),
+        [self]() -> asio::awaitable<void> {
+          auto got = co_await self->tcpConn->recv();
+          self->reading = false;
+          if (self->closing) {
+            co_return;
+          }
+          if (!got) {
+            self->closeStream("error", got.error());
+            co_return;
+          }
+          if (got->eof) {
+            self->closeStream("remote_closed", {});
+            co_return;
+          }
+          if (!got->data.empty()) {
+            self->onBytes(got->data.data(), got->data.size());
+          }
+          if (!self->closing) {
+            self->startRead();
+          }
+        },
+        asio::detached
+    );
+    return;
+  }
   io->async_read_some(
       asio::buffer(readBuf), [self](AsioErrorCode ec, size_t size) {
         self->reading = false;
@@ -1380,6 +1452,31 @@ void Stream::startWrite() {
   }
   writing = true;
   auto self = shared_from_this();
+  if (tcpConn) {
+    std::string chunk = std::move(outQueue.front());
+    outQueue.pop_front();
+    asio::co_spawn(
+        hub->io.get_executor(),
+        [self, chunk = std::move(chunk)]() -> asio::awaitable<void> {
+          auto sent = co_await self->tcpConn->send(chunk);
+          self->writing = false;
+          self->outBytes -= chunk.size();
+          if (self->closing) {
+            co_return;
+          }
+          if (!sent) {
+            self->closeStream("error", sent.error());
+            co_return;
+          }
+          self->onWritten();
+          if (!self->closing) {
+            self->startWrite();
+          }
+        },
+        asio::detached
+    );
+    return;
+  }
   asio::async_write(*io, asio::buffer(outQueue.front()),
                     [self](AsioErrorCode ec, size_t) { self->afterWrite(ec); });
 }
@@ -1416,7 +1513,14 @@ void Stream::closeStream(std::string_view reason, std::string_view error) {
     return;
   }
   closing = true;
-  io->close();
+  if (tcpConn) {
+    tcpConn->abort();
+  } else if (io) {
+    io->close();
+  }
+  if (closedTimer) {
+    closedTimer->cancel();
+  }
   onClosed(reason, error);
   if (hub) {
     hub->onStreamClosed(shared_from_this());
@@ -1516,6 +1620,10 @@ bool PluginNetHub::Impl::listenServer(std::shared_ptr<Server> server,
   if (server->kind == "http") {
     // HTTP 服务交给库（它有 accept 循环、路由、静态文件与保活）
     return listenHttpServer(server, err);
+  }
+  if (server->kind == "tcp") {
+    // TCP 服务交给库（accept 与连接上限在库那边）
+    return listenTcpServer(server, err);
   }
   try {
     asio::ip::tcp::endpoint endpoint{
@@ -1940,6 +2048,34 @@ void PluginNetHub::Impl::rebuildHttpFileRoutes(const Server &server) {
   }
 }
 
+bool PluginNetHub::Impl::listenTcpServer(const std::shared_ptr<Server> &server,
+                                         std::string &err) {
+  utilxx::TcpServer::Config config;
+  config.address = server->host;
+  config.port = server->port;
+  config.maxConnections =
+      static_cast<size_t>((std::max)(int32_t{1}, server->maxConnections));
+  config.connection.connectTimeout = std::chrono::seconds{10};
+  // 长连接: 不设单次读写期限（空闲多久都不算错）
+  config.connection.ioTimeout = std::chrono::milliseconds{0};
+  auto self = shared_from_this();
+  auto tcpServer = std::make_shared<utilxx::TcpServer>(
+      config,
+      [self, server](std::shared_ptr<utilxx::TcpConnection> conn)
+          -> asio::awaitable<void> {
+        co_await self->onTcpAccepted(server, std::move(conn));
+      });
+  auto started = tcpServer->startAsync(io.get_executor());
+  if (!started) {
+    err = started.error();
+    return false;
+  }
+  server->tcp = tcpServer;
+  server->port = tcpServer->port();
+  servers[serverKeyOf(server->plugin, server->kind, server->id)] = server;
+  return true;
+}
+
 asio::awaitable<void> PluginNetHub::Impl::handleHttpRequest(
     const std::shared_ptr<Server> &server, utilxx::HttpServer::Request &req,
     utilxx::HttpServer::Response &resp, std::string_view path,
@@ -2102,6 +2238,9 @@ void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
         wakePendingOfServer(
             serverKeyOf(it->second->plugin, it->second->kind, it->second->id));
       }
+      if (it->second->tcp) {
+        it->second->tcp->stop();
+      }
       if (it->second->acceptor) {
         AsioErrorCode ignored;
         it->second->acceptor->close(ignored);
@@ -2160,15 +2299,10 @@ void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
 /* ==================== TCP 连接 ==================== */
 
 struct TcpStream : Stream {
-  explicit TcpStream(std::shared_ptr<PluginNetHub::Impl> hubRef,
-                     asio::ip::tcp::socket socketRef)
-      : Stream(std::move(hubRef), std::move(socketRef)) {}
+  explicit TcpStream(std::shared_ptr<PluginNetHub::Impl> hubRef)
+      : Stream(std::move(hubRef), std::shared_ptr<utilxx::TcpConnection>{}) {}
 
   std::shared_ptr<PluginNetHub::Impl::Server> server;
-
-  /// 客户端连接状态 (服务端接受来的连接不用)
-  std::unique_ptr<asio::ip::tcp::resolver> resolver;
-  std::unique_ptr<asio::steady_timer> timer;
 
   /// 发起连接 (网络线程); 成功发 `socket.connected`, 失败发 `socket.closed`
   void connectTo(std::string host, uint16_t port, int32_t timeoutMs);
@@ -2692,44 +2826,47 @@ namespace utilxx {
 
 void TcpStream::connectTo(std::string host, uint16_t port, int32_t timeoutMs) {
   connecting = true;
-  timer = std::make_unique<asio::steady_timer>(hub->io);
-  timer->expires_after(std::chrono::milliseconds{(std::max)(timeoutMs, 1000)});
+  utilxx::TcpConfig config;
+  config.connectTimeout =
+      std::chrono::milliseconds{(std::max)(timeoutMs, 1000)};
+  // 长连接: 不设单次读写期限（空闲多久都不算错）
+  config.ioTimeout = std::chrono::milliseconds{0};
   auto self = std::static_pointer_cast<TcpStream>(shared_from_this());
-  timer->async_wait([self](AsioErrorCode ec) {
-    if (!ec) {
-      self->closeStream("timeout", "连接超时");
-    }
-  });
-  resolver = std::make_unique<asio::ip::tcp::resolver>(hub->io);
-  resolver->async_resolve(
-      host, std::to_string(port),
-      [self](AsioErrorCode ec, asio::ip::tcp::resolver::results_type results) {
-        if (ec) {
-          self->closeStream("connect_failed", "解析失败: " + errorTextOf(ec));
-          return;
+  auto executor = hub->io.get_executor();
+  asio::co_spawn(
+      executor,
+      [self, executor, host, port, config]() -> asio::awaitable<void> {
+        std::expected<std::unique_ptr<utilxx::TcpConnection>, std::string>
+            connected = std::unexpected{std::string{"connect failed"}};
+        try {
+          connected = co_await utilxx::TcpConnection::connect(executor, host,
+                                                              port, config);
+        } catch (const std::exception &e) {
+          connected = std::unexpected{std::string{e.what()}};
+        } catch (...) {
+          connected = std::unexpected{std::string{"connect failed"}};
         }
-        asio::async_connect(
-            self->io->lowest_layer(), results,
-            [self](AsioErrorCode connectEc, const asio::ip::tcp::endpoint &) {
-              if (connectEc) {
-                self->closeStream("connect_failed",
-                                  "连接失败: " + errorTextOf(connectEc));
-                return;
-              }
-              self->onConnected();
-            });
-      });
+        if (self->closing) {
+          co_return;
+        }
+        if (!connected) {
+          self->closeStream("connect_failed", connected.error());
+          co_return;
+        }
+        self->tcpConn =
+            std::shared_ptr<utilxx::TcpConnection>(std::move(*connected));
+        self->onConnected();
+      },
+      asio::detached
+  );
 }
 
 void TcpStream::onConnected() {
   connecting = false;
-  if (timer) {
-    AsioErrorCode ignored;
-    timer->cancel();
+  if (tcpConn) {
+    remote = tcpConn->peerAddress();
+    local = tcpConn->localAddress();
   }
-  AsioErrorCode ec;
-  remote = endpointText(io->lowest_layer().remote_endpoint(ec));
-  local = endpointText(io->lowest_layer().local_endpoint(ec));
   Json event;
   event["kind"] = "socket.connected";
   event["id"] = id;
@@ -2737,6 +2874,45 @@ void TcpStream::onConnected() {
   event["local"] = local;
   hub->emit(plugin, std::move(event));
   start();
+}
+
+/* ==================== TCP 服务端连接 ==================== */
+
+asio::awaitable<void> PluginNetHub::Impl::onTcpAccepted(
+    const std::shared_ptr<Server> &server,
+    std::shared_ptr<utilxx::TcpConnection> conn) {
+  auto self = shared_from_this();
+  if (!conn || !server) {
+    co_return;
+  }
+  if (server->conns.size() >= static_cast<size_t>(server->maxConnections) ||
+      connectionCountOf(server->plugin) >= kMaxConnectionsPerPlugin) {
+    conn->abort();
+    co_return;
+  }
+  const int64_t seq = nextConnSeq.fetch_add(1, std::memory_order_relaxed);
+  auto tcp = std::make_shared<TcpStream>(self);
+  tcp->tcpConn = std::move(conn);
+  tcp->plugin = server->plugin;
+  tcp->serverId = server->id;
+  tcp->id = server->id + "#" + std::to_string(seq);
+  tcp->server = server;
+  tcp->remote = tcp->tcpConn->peerAddress();
+  tcp->local = tcp->tcpConn->localAddress();
+  if (!registerStream(tcp)) {
+    tcp->closeStream("error", "too_many");
+    co_return;
+  }
+  Json event;
+  event["kind"] = "socket.accepted";
+  event["serverId"] = server->id;
+  event["id"] = tcp->id;
+  event["remote"] = tcp->remote;
+  event["local"] = tcp->local;
+  emit(server->plugin, std::move(event));
+  tcp->start();
+  // 这条协程就是连接的生命周期: 连接关掉（或服务停止）才返回
+  co_await tcp->waitClosed();
 }
 
 /* ==================== WebSocket ==================== */
@@ -3349,9 +3525,10 @@ void PluginNetHub::Impl::onAccepted(const std::shared_ptr<Server> &server,
     ws->armTimer(10000);
     stream = ws;
   } else {
-    auto tcp = std::make_shared<TcpStream>(shared_from_this(), std::move(socket));
-    tcp->server = server;
-    stream = tcp;
+    // 其它类型（tcp 现在走库的 TcpServer，不会进到这里）: 直接关掉
+    AsioErrorCode ignored;
+    socket.close(ignored);
+    return;
   }
   stream->plugin = server->plugin;
   stream->serverId = server->id;
@@ -3831,6 +4008,9 @@ void PluginNetHub::Impl::stopServers(const std::string &plugin,
       wakePendingOfServer(
           serverKeyOf(server->plugin, server->kind, server->id));
     }
+    if (server->tcp) {
+      server->tcp->stop();
+    }
     if (server->acceptor) {
       AsioErrorCode ignored;
       server->acceptor->close(ignored);
@@ -4238,8 +4418,7 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
       out = errorJson("exists", "同名的连接已经存在");
       return PLUGINXX_NET_OK;
     }
-    auto stream = std::make_shared<TcpStream>(shared_from_this(),
-                                              asio::ip::tcp::socket(io));
+    auto stream = std::make_shared<TcpStream>(shared_from_this());
     stream->plugin = plugin;
     stream->id = id;
     if (!registerStream(stream)) {
