@@ -71,6 +71,9 @@ inline constexpr uint64_t kDefaultMaxResponseBody = 10 * 1024 * 1024;
 /// - readChunkTimeout: 相邻数据块到达间隔的期限; readChunkTimeout 内没有新数据
 ///   到达视为超时 (每收到新数据计时器重置)。这是"块间"超时, 不是整个响应的
 ///   总超时 —— 只要数据持续到达, 连接就一直保持
+/// - readChunkTimeoutPerRead: 每次读响应体之前取样一次本轮的块间超时; 为空或返回
+///   nullopt 时用 readChunkTimeout。用于流中途**收紧**等待上限 (例如上游已给出
+///   "生成结束"信号、只差结束标记时, 不必再按完整间隔等)
 /// - keepAlive: 启用 HTTP keep-alive + 连接池复用 (见 maxConcurrentConnections)。
 ///   false (默认) 时请求头带 Connection: close, 每次新建连接、响应后立即关闭。
 ///   流式 API 等高频长连接端点需显式启用以复用连接池。
@@ -86,6 +89,8 @@ struct RequestConfig {
     bool                                     keepAlive                = false;
     size_t                                   maxConcurrentConnections = 5;
     uint64_t                                 maxResponseBody          = kDefaultMaxResponseBody;
+    /// 每次读响应体时取样的块间超时 (见结构体注释); 为空表示始终用 readChunkTimeout
+    std::function<std::optional<std::chrono::milliseconds>()> readChunkTimeoutPerRead;
 };
 
 class UTILXX_API HttpClient {

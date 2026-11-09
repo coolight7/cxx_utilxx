@@ -1492,15 +1492,28 @@ asio::awaitable<void> HttpClient::requestSseAsync(
             }
         };
 
+        // 读 body 的块间上限: 允许调用方按当前流状态逐次收紧
+        // (见 RequestConfig::readChunkTimeoutPerRead; 非正值视为未指定, 退回默认值)
+        auto nextBodyReadTimeout = [&]() -> std::chrono::milliseconds {
+            if (!config.readChunkTimeoutPerRead) {
+                return config.readChunkTimeout;
+            }
+            auto asked = config.readChunkTimeoutPerRead();
+            if (asked.has_value() && asked->count() > 0) {
+                return *asked;
+            }
+            return config.readChunkTimeout;
+        };
+
         // 初始 flush: 响应头与首个 body 数据可能在同一数据块中到达
         if (flushBody()) {
             stopReading();
         } else {
             while (!parser.is_done()) {
-                // 读 body: 每次读操作独立计时 (readChunkTimeout = 块间最大间隔), 超时断开
+                // 读 body: 每次读操作独立计时 (块间最大间隔), 超时断开
                 co_await runSseOpWithTimeout(
                     stream,
-                    config.readChunkTimeout,
+                    nextBodyReadTimeout(),
                     "read-body",
                     [&]() -> asio::awaitable<void> {
                         co_await http::async_read_some(stream, buf, parser, asio::use_awaitable);
