@@ -26,6 +26,7 @@
 #include <functional>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -50,7 +51,7 @@ UTILXX_API std::string formatHttpDate(std::time_t t) noexcept;
 // HttpServer —— 异步 HTTP/WebSocket/SSE 服务器
 // ---------------------------------------------------------------------------
 
-class UTILXX_API HttpServer {
+class UTILXX_API HttpServer : public std::enable_shared_from_this<HttpServer> {
 public:
 
     using Request  = boost::beast::http::request<boost::beast::http::string_body>;
@@ -373,6 +374,17 @@ private:
     /// startAsync 模式的 accept 循环 — 所有连接在同一 executor 上服务
     asio::awaitable<void> acceptLoopAsync();
 
+    // -----------------------------------------------------------------------
+    // 活跃连接跟踪 — stop() 要把还活着的连接一起关掉
+    // （保持连接的客户端会复用同一条 socket，不关的话服务停了还能继续发请求）
+    // -----------------------------------------------------------------------
+
+    void trackConnection(const std::shared_ptr<boost::beast::tcp_stream>& stream);
+
+    void untrackConnection(const std::shared_ptr<boost::beast::tcp_stream>& stream);
+
+    void closeTrackedConnections();
+
     /// 服务一条 TCP 连接 (成员协程 — 避免悬挂的 lambda 捕获)
     asio::awaitable<void> serveTcp(std::shared_ptr<boost::beast::tcp_stream> stream);
 
@@ -389,8 +401,9 @@ private:
 
     /// 静态文件路由的实现: 自己写完整响应（头 + 分块 body），返回 true 表示已处理
     ///
-    /// - 只支持单段 `Range`（`bytes=a-b` / `bytes=a-`），多段或语法不对时当没有 Range 回 200；
-    /// - 起点越界回 416（带 `Content-Range: bytes */总长`）；
+    /// - 只支持单段 `Range`（`bytes=a-b` / `bytes=a-` / `bytes=-N`），多段或语法不对时
+    ///   当没有 Range 回 200；
+    /// - 起点越界、后缀长度为 0 回 416（带 `Content-Range: bytes */总长`）；
     /// - `HEAD` 只写头（Content-Length 保留），不写 body；
     /// - 文件打不开返回 false，调用方继续走 router（最终 404）。
     template<typename Stream>
@@ -438,36 +451,55 @@ private:
                 const auto spec = text.substr(6);
                 const auto dash = spec.find('-');
                 if (dash != std::string_view::npos) {
-                    uint64_t   start = 0;
-                    uint64_t   end   = total - 1;
                     const auto head_ = spec.substr(0, dash);
-                    bool       ok    = !head_.empty();
-                    if (ok) {
+                    const auto tail_ = spec.substr(dash + 1);
+                    bool       ok    = false;
+                    if (head_.empty()) {
+                        // `bytes=-N`: 取末尾 N 字节 (播放器读尾部元数据会这么发)
+                        uint64_t   suffix = 0;
+                        const auto parsed = std::from_chars(
+                            tail_.data(),
+                            tail_.data() + tail_.size(),
+                            suffix
+                        );
+                        if (!tail_.empty() && parsed.ec == std::errc{}) {
+                            // RFC 7233: 后缀长度为 0 不可满足
+                            if (suffix == 0) {
+                                co_return co_await reply416();
+                            }
+                            ok     = true;
+                            offset = suffix >= total ? 0 : total - suffix;
+                            length = total - offset;
+                        }
+                    } else {
+                        uint64_t   start = 0;
+                        uint64_t   end   = total - 1;
                         const auto parsed = std::from_chars(
                             head_.data(),
                             head_.data() + head_.size(),
                             start
                         );
                         ok = parsed.ec == std::errc{};
-                    }
-                    const auto tail_ = spec.substr(dash + 1);
-                    if (ok && !tail_.empty()) {
-                        const auto parsed = std::from_chars(
-                            tail_.data(),
-                            tail_.data() + tail_.size(),
-                            end
-                        );
-                        ok = parsed.ec == std::errc{} && end >= start;
+                        if (ok && !tail_.empty()) {
+                            const auto parsedEnd = std::from_chars(
+                                tail_.data(),
+                                tail_.data() + tail_.size(),
+                                end
+                            );
+                            ok = parsedEnd.ec == std::errc{} && end >= start;
+                        }
+                        if (ok) {
+                            if (start >= total) {
+                                co_return co_await reply416();
+                            }
+                            if (end >= total) {
+                                end = total - 1;
+                            }
+                            offset = start;
+                            length = end - start + 1;
+                        }
                     }
                     if (ok) {
-                        if (start >= total) {
-                            co_return co_await reply416();
-                        }
-                        if (end >= total) {
-                            end = total - 1;
-                        }
-                        offset = start;
-                        length = end - start + 1;
                         status = http::status::partial_content;
                     }
                 }
@@ -531,7 +563,7 @@ private:
     }
 
     template<typename Stream>
-    asio::awaitable<void> serve(Stream stream) {
+    asio::awaitable<void> serve(Stream& stream) {
         namespace http = boost::beast::http;
         utilxx_base::AsioErrorCode ec;
 
@@ -990,6 +1022,10 @@ private:
     std::atomic<bool>                        stopped_{false};
     std::atomic<size_t>                      activeConnections_{0};
     std::atomic<size_t>                      nextWorker_{0};
+
+    /// 活跃连接（weak: 协程自己结束时连接自然释放，这里只用于停止时统一关掉）
+    std::mutex                                                     connMutex_;
+    std::vector<std::weak_ptr<boost::beast::tcp_stream>>           trackedConns_;
 
     /// SSE 流式路由 (仅 GET) — 按路径索引
     std::unordered_map<

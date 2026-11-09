@@ -762,6 +762,8 @@ struct Stream : std::enable_shared_from_this<Stream> {
   bool reading = false;
   /// `waitClosed()` 的等待点（关掉连接时取消）
   std::shared_ptr<asio::steady_timer> closedTimer;
+  /// 发送队列排空时限（`requestClose` 等待写完时的上限；连接关掉时取消）
+  std::shared_ptr<asio::steady_timer> flushTimer;
 
   /// 等这条连接关掉（服务端的 accept 协程靠它挂到连接结束）
   asio::awaitable<void> waitClosed();
@@ -773,6 +775,8 @@ struct Stream : std::enable_shared_from_this<Stream> {
 
   /// WebSocket 用: 带帧类型的发送（`opcode`: 1 文本 / 2 二进制 / 9 ping）
   void sendWs(int32_t opcode, std::string data, std::string &err);
+  /// 关连接：队列里还有没写出去的字节时先写完（插件“发完最后一段就 close”很常见）
+  void requestClose();
   void flushThenClose();
   void closeStream(std::string_view reason, std::string_view error);
 
@@ -1359,10 +1363,37 @@ void Stream::afterWrite(AsioErrorCode ec) {
 }
 
 void Stream::flushThenClose() {
+  if (closing || closeWhenFlushed) {
+    return;
+  }
   closeWhenFlushed = true;
   if (!writing && outQueue.empty()) {
     closeStream("local_close", {});
+    return;
   }
+  // 对端一直不读的时候不能一直挂着：到点强关（已关掉时这个定时器会被取消）
+  if (hub) {
+    flushTimer = std::make_shared<asio::steady_timer>(hub->io);
+    flushTimer->expires_after(std::chrono::seconds{5});
+    auto self = shared_from_this();
+    flushTimer->async_wait([self](const std::error_code &ec) {
+      if (ec) {
+        return;
+      }
+      self->closeStream("local_close", {});
+    });
+  }
+}
+
+void Stream::requestClose() {
+  if (closing) {
+    return;
+  }
+  if (outQueue.empty() && !writing) {
+    closeStream("local_close", {});
+    return;
+  }
+  flushThenClose();
 }
 
 void Stream::closeStream(std::string_view reason, std::string_view error) {
@@ -1377,6 +1408,9 @@ void Stream::closeStream(std::string_view reason, std::string_view error) {
   }
   if (closedTimer) {
     closedTimer->cancel();
+  }
+  if (flushTimer) {
+    flushTimer->cancel();
   }
   onClosed(reason, error);
   if (hub) {
@@ -1699,6 +1733,7 @@ bool PluginNetHub::Impl::removeStaticRoute(const std::shared_ptr<Server> &server
 namespace {
 
 /// 回一条固定文本的小响应（内部错误 / 404 / 503 / 504 用）
+/// 这类短响应不必保持连接：以前的手写实现也是回完就关
 void setSimpleHttpResponse(utilxx::HttpServer::Request &req,
                            utilxx::HttpServer::Response &resp,
                            boost::beast::http::status status,
@@ -1708,7 +1743,7 @@ void setSimpleHttpResponse(utilxx::HttpServer::Request &req,
   resp.result(status);
   resp.set(http::field::content_type, "text/plain; charset=utf-8");
   resp.body().assign(std::string{text} + "\n");
-  resp.keep_alive(req.keep_alive());
+  resp.keep_alive(false);
 }
 
 /// 把插件给的响应（status / headers / body|bodyBase64 / contentType）填进响应
@@ -3531,7 +3566,7 @@ void PluginNetHub::Impl::closeConn(const std::string &plugin,
   if (auto ws = std::dynamic_pointer_cast<WsStream>(stream)) {
     ws->closeByPlugin(1000, {});
   } else {
-    stream->closeStream("local_close", {});
+    stream->requestClose();
   }
   out = Json::object();
   out["ok"] = true;

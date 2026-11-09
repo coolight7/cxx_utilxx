@@ -1,6 +1,7 @@
 #include "utilxx/http_server.h"
 #include "utilxx_base/asio_error.h"
 #include "utilxx/http_client.h"
+#include <algorithm>
 #include <array>
 
 namespace utilxx {
@@ -218,6 +219,9 @@ void HttpServer::stop() {
         acceptor_->cancel(ec);
         acceptor_->close(ec);
     }
+    // 已建立的连接也要关：客户端会复用同一条 socket，只关 acceptor 的话
+    // 正在等下一个请求的会话还能继续回答（服务“停不掉”）
+    closeTrackedConnections();
     // Release work guards so io_context::run() can return
     for (auto& w : workers_) {
         if (w->workGuard) {
@@ -316,13 +320,81 @@ void HttpServer::startAsync(asio::any_io_executor executor) {
     XX_OUT("[server] Listening on {}:{} (async mode)", config_.address, port());
 }
 
+void HttpServer::trackConnection(const std::shared_ptr<boost::beast::tcp_stream>& stream) {
+    std::lock_guard<std::mutex> lock{connMutex_};
+    // 顺手清掉已经结束的项: 连接表只会随 accept 增长，不清理会一直变大
+    trackedConns_.erase(
+        std::remove_if(
+            trackedConns_.begin(),
+            trackedConns_.end(),
+            [](const std::weak_ptr<boost::beast::tcp_stream>& item) { return item.expired(); }
+        ),
+        trackedConns_.end()
+    );
+    trackedConns_.push_back(stream);
+}
+
+void HttpServer::untrackConnection(const std::shared_ptr<boost::beast::tcp_stream>& stream) {
+    std::lock_guard<std::mutex> lock{connMutex_};
+    trackedConns_.erase(
+        std::remove_if(
+            trackedConns_.begin(),
+            trackedConns_.end(),
+            [&](const std::weak_ptr<boost::beast::tcp_stream>& item) {
+                const auto locked = item.lock();
+                return !locked || locked == stream;
+            }
+        ),
+        trackedConns_.end()
+    );
+}
+
+void HttpServer::closeTrackedConnections() {
+    std::vector<std::shared_ptr<boost::beast::tcp_stream>> closing;
+    {
+        std::lock_guard<std::mutex> lock{connMutex_};
+        closing.reserve(trackedConns_.size());
+        for (const auto& item : trackedConns_) {
+            if (auto locked = item.lock()) {
+                closing.push_back(std::move(locked));
+            }
+        }
+        trackedConns_.clear();
+    }
+    for (const auto& stream : closing) {
+        utilxx_base::AsioErrorCode ec;
+        auto&                     socket = boost::beast::get_lowest_layer(*stream).socket();
+        // 先取消挂起的收发再关（与 TcpConnection::abort 同理：带挂起读的 close
+        // 在 Windows 上会把连接重置，已写出的数据可能与客户端无缘）
+        socket.cancel(ec);
+        socket.close(ec);
+    }
+}
+
 asio::awaitable<void> HttpServer::serveTcp(std::shared_ptr<boost::beast::tcp_stream> stream) {
     ConnectionGuard guard{activeConnections_};
+    // stop() 会关掉这条连接的 socket，协程随之苏醒；此时服务对象可能已被销毁，
+    // 所以整条连接期间要抱住它（栈上构造的对象拿不到，保持原行为）。
+    const std::shared_ptr<HttpServer> keepAlive = weak_from_this().lock();
+    (void)keepAlive;
+    trackConnection(stream);
+    // 协程无论怎么退出都要从跟踪表里去掉，否则表会越积越多
+    struct Untracker {
+        HttpServer*                              server;
+        std::shared_ptr<boost::beast::tcp_stream> stream;
+        ~Untracker() {
+            server->untrackConnection(stream);
+        }
+    } untracker{this, stream};
+    // 接受完就 stop() 的边角情况: 不要再处理请求
+    if (stopped_) {
+        co_return;
+    }
     // 捕获异常, 避免客户端在读写期间断开时异常逃逸 detached 协程 → terminate;
     // 取消/中断是预期行为 (见 utilxx::CanceledException 与主程序注册的控制流
     // 异常识别 utilxx_base::setExtraExceptionClassifier), 静默返回
     try {
-        co_await serve(std::move(*stream));
+        co_await serve(*stream);
     } catch (const utilxx::CanceledException&) {
         // 取消: 连接终止是预期行为, 静默返回
     } catch (const utilxx_base::AsioSystemError& e) {
@@ -341,6 +413,8 @@ asio::awaitable<void> HttpServer::serveTcp(std::shared_ptr<boost::beast::tcp_str
 
 asio::awaitable<void> HttpServer::acceptLoop() {
     using tcp     = asio::ip::tcp;
+    const std::shared_ptr<HttpServer> keepAlive = weak_from_this().lock();
+    (void)keepAlive;
     auto executor = co_await asio::this_coro::executor;
     while (!stopped_) {
         utilxx_base::AsioErrorCode ec;
@@ -406,6 +480,8 @@ asio::awaitable<void> HttpServer::acceptLoop() {
 
 asio::awaitable<void> HttpServer::acceptLoopAsync() {
     using tcp     = asio::ip::tcp;
+    const std::shared_ptr<HttpServer> keepAlive = weak_from_this().lock();
+    (void)keepAlive;
     auto executor = co_await asio::this_coro::executor;
     while (!stopped_) {
         utilxx_base::AsioErrorCode ec;

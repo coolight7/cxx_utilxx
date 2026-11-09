@@ -187,8 +187,10 @@ void TcpConnection::abort() noexcept {
     if (impl_->closed.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
-    // 跨线程关闭: 只置标志 + close, 挂起的收发会以 operation_aborted 返回
+    // 先取消挂起的收发再关：Windows 上带挂起读的 closesocket 会把连接重置，
+    // 已经写进发送缓冲的数据会被丢掉（表现为客户端少收一截）
     AsioErrorCode ec;
+    impl_->socket.cancel(ec);
     impl_->socket.close(ec);
 }
 
