@@ -184,24 +184,31 @@ unset(_t)
 
 cxx_lib_set_own_dir_rpath(cxx_utilxx_shared)
 
-# ===== 安装与导出 =====
-install(TARGETS cxx_utilxx_shared cxx_utilxx_static
-  EXPORT cxx_utilxxTargets
-  LIBRARY DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
-  RUNTIME DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
-  ARCHIVE DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
-)
-install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
-install(EXPORT cxx_utilxxTargets
-  NAMESPACE ""
-  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
-)
+# 只在自己是顶层工程时安装/导出: 被主工程 add_subdirectory 引入时,
+# 依赖目标 (fmt / simdjson / uchardet / iconv / html2md) 不在同一个导出集里,
+# install(EXPORT) 会报 "requires target ... not in any export set"; 那种用法也不需要安装。
+if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  # ===== 安装与导出 =====
+  install(TARGETS cxx_utilxx_shared cxx_utilxx_static
+    EXPORT cxx_utilxxTargets
+    LIBRARY DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
+    RUNTIME DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
+    ARCHIVE DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
+  )
+  install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+  install(EXPORT cxx_utilxxTargets
+    NAMESPACE ""
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
+  )
 
-configure_package_config_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cxx_utilxxConfig.cmake.in"
-  "${CMAKE_CURRENT_BINARY_DIR}/cxx_utilxxConfig.cmake"
-  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
-)
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/cxx_utilxxConfig.cmake"
-  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
-)
+  configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cxx_utilxxConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/cxx_utilxxConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
+  )
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/cxx_utilxxConfig.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
+  )
+else ()
+  message(STATUS "[cxx_utilxx] add_subdirectory 引入: 跳过 install/export")
+endif ()
