@@ -21,6 +21,8 @@
 #include <asio/execution/context.hpp>
 #include <asio/execution_context.hpp>
 #include <asio/steady_timer.hpp>
+#include <filesystem>
+#include <fstream>
 #include <list>
 #include <map>
 #include <openssl/ssl.h>
@@ -304,6 +306,8 @@ struct PooledConnection {
         stream(std::in_place_index<0>, std::move(executor)) {}
 
     std::variant<asio::ip::tcp::socket, asio::ssl::stream<asio::ip::tcp::socket>> stream;
+    /// 本次连接用的 TLS 上下文（调用方传了自己的就留一份强引用，保证流活着时上下文也在）
+    std::shared_ptr<asio::ssl::context>                                         sslCtx;
     std::chrono::steady_clock::time_point                                         lastUsed;
     bool fresh = true; ///< 本次是否新建 (非复用), 供失效重试决策
 };
@@ -699,11 +703,29 @@ asio::awaitable<std::shared_ptr<PooledConnection>>
 
     auto conn = std::make_shared<PooledConnection>(executor);
     if (key.https) {
-        auto& sslCtx = HttpClient::sharedSslCtx(key.verify);
-        auto& stream = conn->stream.emplace<asio::ssl::stream<tcp::socket>>(executor, sslCtx);
+        // 调用方给了自己的上下文（插件网络要额外信任的 CA）就用它，否则用进程共享的那个
+        asio::ssl::context* ctx = &HttpClient::sharedSslCtx(key.verify);
+        if (config.sslContext) {
+            conn->sslCtx = config.sslContext;
+            ctx          = conn->sslCtx.get();
+        }
+        auto& stream = conn->stream.emplace<asio::ssl::stream<tcp::socket>>(executor, *ctx);
         // SNI 只能是域名, IP 字面量 (IPv6 含 ':') 不支持 SNI
-        if (!key.host.empty() && key.host.find(':') == std::string::npos) {
-            ::SSL_set_tlsext_host_name(stream.native_handle(), key.host.c_str());
+        const std::string sni = config.sslServerName.empty() ? key.host : config.sslServerName;
+        if (!sni.empty() && sni.find(':') == std::string::npos) {
+            ::SSL_set_tlsext_host_name(stream.native_handle(), sni.c_str());
+        }
+        // 主机名校验: 插件客户端要校验证书里的名字与地址是否匹配 (库里默认只校链)
+        if (config.sslVerifyHost && !sni.empty()) {
+            SSL*             ssl = stream.native_handle();
+            utilxx_base::AsioErrorCode addressEc;
+            const auto       address = asio::ip::make_address(sni, addressEc);
+            if (addressEc) {
+                ::SSL_set1_host(ssl, sni.c_str());
+            } else {
+                // IP 字面量: 证书里要有对应的 IP SAN (DNS 名校验对 IP 不适用)
+                ::X509_VERIFY_PARAM_set1_ip_asc(::SSL_get0_param(ssl), sni.c_str());
+            }
         }
         co_await asio::async_connect(
             stream.lowest_layer(),
@@ -1222,7 +1244,10 @@ asio::awaitable<std::expected<HttpResponse, std::string>> HttpClient::requestAsy
 
                 // 连接池: keepAlive=true 时启用 (复用空闲连接 + 并发上限), 否则保持
                 // 旧行为 (每次新建连接, 响应后关闭, 不受并发上限约束)
-                bool   usePool  = config.keepAlive;
+                // 本次请求带了自己的 TLS 上下文 / 主机名校验选项时不走池: 池键装不下这些差异
+                const bool customTls = config.sslContext != nullptr || config.sslVerifyHost
+                                       || !config.sslServerName.empty();
+                bool   usePool  = config.keepAlive && !customTls;
                 size_t poolMax  = usePool ? config.maxConcurrentConnections : 0;
                 int maxAttempts = usePool ? 2 : 1; // 复用失效连接时用新连接重试一次
 
@@ -1307,6 +1332,7 @@ asio::awaitable<std::expected<HttpResponse, std::string>> HttpClient::requestAsy
         if (!result.has_value()) {
             break;
         }
+        result->redirects = redirectCount;
         if (redirectCount >= config.followRedirect) {
             break;
         }
@@ -1589,6 +1615,194 @@ asio::awaitable<void> HttpClient::requestSseAsync(
             pool.release(poolKey, std::move(conn), usePool && poolable);
         }
         break;
+    }
+}
+
+asio::awaitable<std::expected<DownloadResult, std::string>> HttpClient::downloadAsync(
+    std::string_view                                      url,
+    std::string_view                                      filePath,
+    const HeaderMap&                                      extraHeaders,
+    const RequestConfig&                                  config,
+    std::function<void(uint64_t, std::optional<uint64_t>)> onProgress
+) {
+    namespace http = boost::beast::http;
+    using asio::ip::tcp;
+
+    std::string currentUrl{url};
+    for (size_t redirectCount = 0;; ++redirectCount) {
+        auto parsed = parseUrl(currentUrl);
+        if (!parsed) {
+            co_return std::unexpected{fmt::format("invalid url: {}", currentUrl)};
+        }
+        const bool isHttps = parsed->scheme == "https";
+
+        http::request<http::string_body> req{http::verb::get, parsed->path, 11};
+        req.set(http::field::host, buildHostHeader(*parsed));
+        for (const auto& [k, v] : defaultHeaders().data) {
+            req.set(k, utilxx_base::stringVectorJoin(v, "; "));
+        }
+        // 下载要的是原始字节: 不让网关压缩, 也不要 keep-alive (文件可能很大, 连接用完即关)
+        req.set(http::field::accept_encoding, "identity");
+        req.set(http::field::connection, "close");
+        for (const auto& [k, v] : extraHeaders.data) {
+            req.set(k, utilxx_base::stringVectorJoin(v, "; "));
+        }
+
+        HttpPoolKey poolKey;
+        poolKey.https  = isHttps;
+        poolKey.host   = parsed->host;
+        poolKey.port   = parsed->port;
+        poolKey.verify = config.sslVerify.value_or(sslVerifyEnabled_.load(std::memory_order_relaxed));
+
+        std::shared_ptr<PooledConnection> conn;
+        try {
+            conn = co_await createConnection(poolKey, config);
+        } catch (const std::exception& e) {
+            co_return std::unexpected{std::string{e.what()}};
+        }
+        const auto sendTimeout = config.sendTimeout.value_or(calcTimeoutBySize(0));
+
+        std::expected<DownloadResult, std::string> result
+            = std::unexpected{std::string{"unknown error"}};
+        co_await utilxx_base::catchErrorAsync<bool>(
+            [&]() -> asio::awaitable<bool> {
+                co_return co_await std::visit(
+                    [&](auto& stream) -> asio::awaitable<bool> {
+                        co_await http::async_write(
+                            stream,
+                            req,
+                            asio::cancel_after(sendTimeout, asio::use_awaitable)
+                        );
+                        boost::beast::flat_buffer                    buf;
+                        http::response_parser<http::buffer_body> parser;
+                        if (config.maxResponseBody > 0) {
+                            parser.body_limit(config.maxResponseBody);
+                        }
+                        // 响应头迟迟不来就断开 (与 exchange 的时间语义一致)
+                        co_await http::async_read_header(
+                            stream,
+                            buf,
+                            parser,
+                            asio::cancel_after(config.readChunkTimeout, asio::use_awaitable)
+                        );
+
+                        const int status = parser.get().result_int();
+                        HeaderMap headers;
+                        for (const auto& field : parser.get()) {
+                            headers.set(field.name_string(), field.value());
+                        }
+                        if (status / 100 != 2) {
+                            // 非 2xx: 读一小段正文当错误说明 (不落盘)
+                            std::string  errBody;
+                            std::array<char, 2048> small{};
+                            while (!parser.is_done() && errBody.size() < sizeof(small)) {
+                                parser.get().body().data = small.data();
+                                parser.get().body().size = sizeof(small);
+                                utilxx_base::AsioErrorCode ec;
+                                co_await http::async_read_some(
+                                    stream,
+                                    buf,
+                                    parser,
+                                    asio::cancel_after(
+                                        config.readChunkTimeout,
+                                        asio::redirect_error(asio::use_awaitable, ec)
+                                    )
+                                );
+                                if (ec && ec != http::error::need_buffer) {
+                                    break;
+                                }
+                                errBody.append(small.data(), sizeof(small) - parser.get().body().size);
+                            }
+                            result = std::unexpected{fmt::format(
+                                "HTTP {}: {}",
+                                status,
+                                errBody.empty() ? std::string{"download failed"} : errBody
+                            )};
+                            co_return true;
+                        }
+
+                        std::ofstream out(std::string{filePath}, std::ios::binary | std::ios::trunc);
+                        if (!out) {
+                            result = std::unexpected{
+                                fmt::format("cannot open file: {}", filePath)
+                            };
+                            co_return true;
+                        }
+                        std::optional<uint64_t> total;
+                        const auto              cl = parser.get()[http::field::content_length];
+                        if (!cl.empty()) {
+                            uint64_t     value = 0;
+                            const auto   parsedLength
+                                = std::from_chars(cl.data(), cl.data() + cl.size(), value);
+                            if (parsedLength.ec == std::errc{}) {
+                                total = value;
+                            }
+                        }
+                        std::array<char, 64 * 1024> chunk{};
+                        uint64_t                    received = 0;
+                        while (!parser.is_done()) {
+                            parser.get().body().data = chunk.data();
+                            parser.get().body().size = chunk.size();
+                            utilxx_base::AsioErrorCode ec;
+                            co_await http::async_read_some(
+                                stream,
+                                buf,
+                                parser,
+                                asio::cancel_after(
+                                    config.readChunkTimeout,
+                                    asio::redirect_error(asio::use_awaitable, ec)
+                                )
+                            );
+                            // need_buffer = "这一块读完了, 继续读下一块", 不是错误
+                            if (ec && ec != http::error::need_buffer) {
+                                throw utilxx_base::AsioSystemError(ec);
+                            }
+                            const size_t n = chunk.size() - parser.get().body().size;
+                            if (n > 0) {
+                                out.write(chunk.data(), static_cast<std::streamsize>(n));
+                                if (!out) {
+                                    throw std::runtime_error{
+                                        fmt::format("write file failed: {}", filePath)
+                                    };
+                                }
+                                received += n;
+                                if (onProgress) {
+                                    onProgress(received, total);
+                                }
+                            }
+                        }
+                        out.close();
+                        DownloadResult download;
+                        download.status   = status;
+                        download.filePath = std::string{filePath};
+                        download.bytes    = received;
+                        download.headers  = std::move(headers);
+                        result            = std::move(download);
+                        co_return true;
+                    },
+                    conn->stream
+                );
+            },
+            [&](std::string errInfo) -> asio::awaitable<bool> {
+                result = std::unexpected{errInfo};
+                co_return true;
+            }
+        );
+
+        if (!result.has_value()) {
+            // 失败 / 取消: 不留半成品文件
+            std::error_code ignored;
+            std::filesystem::remove(std::string{filePath}, ignored);
+            co_return result;
+        }
+        if (redirectCount >= config.followRedirect || !isRedirectStatus(result->status)) {
+            co_return result;
+        }
+        const std::string_view location = result->headers.getSingle("location");
+        if (location.empty()) {
+            co_return result;
+        }
+        currentUrl = resolveRedirectUrl(currentUrl, location);
     }
 }
 

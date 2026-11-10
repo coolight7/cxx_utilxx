@@ -19,11 +19,14 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
 #include <boost/beast/websocket.hpp>
+#include <charconv>
 #include <chrono>
 #include <ctime>
+#include <fstream>
 #include <functional>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -48,7 +51,7 @@ UTILXX_API std::string formatHttpDate(std::time_t t) noexcept;
 // HttpServer —— 异步 HTTP/WebSocket/SSE 服务器
 // ---------------------------------------------------------------------------
 
-class UTILXX_API HttpServer {
+class UTILXX_API HttpServer : public std::enable_shared_from_this<HttpServer> {
 public:
 
     using Request  = boost::beast::http::request<boost::beast::http::string_body>;
@@ -59,6 +62,23 @@ public:
 
     using WsStream  = boost::beast::websocket::stream<boost::beast::tcp_stream>;
     using WsHandler = std::function<asio::awaitable<void>(WsStream&)>;
+
+    /// 带握手请求的 WebSocket 处理器（任意路径升级用）
+    ///
+    /// 比 [WsHandler] 多拿到握手请求：路径、头、子协议都从里面读。
+    using WsRequestHandler
+        = std::function<asio::awaitable<void>(WsStream&, const Request&)>;
+
+    /// 兜底处理器：路由没命中时调用（插件网络用它把请求交给插件自己回答）
+    ///
+    /// 参数：请求、响应、去 query 后的路径、对端地址（`1.2.3.4:5678`）。
+    /// 置了兜底处理器就不会再回 404 / 405，响应由处理器自己填。
+    using FallbackHandler = std::function<asio::awaitable<void>(
+        Request&,
+        Response&,
+        std::string_view path,
+        std::string_view peer
+    )>;
 
     /// 流式 SSE 连接 — 初始响应头发送后, handler 可持有本对象持续推送事件
     class SseWriter {
@@ -154,6 +174,31 @@ public:
     /// 注册 WebSocket 端点。客户端向该路径发送带 Upgrade: websocket 的 GET
     /// 请求时连接被升级, 随后以 websocket 流调用该 handler。
     void enableWebSocket(std::string_view path, WsHandler handler);
+
+    /// 注册任意路径的 WebSocket 升级（没命中 `enableWebSocket` 的路径都交给它）
+    ///
+    /// 用处：调用方自己按请求里的路径 / 头做分流（插件的 `ws.listen` 就是这样）。
+    void enableWebSocketAny(WsRequestHandler handler);
+
+    /// 注册静态文件路由（`GET` / `HEAD`，**精确匹配**路径；已带 query 的请求按去 query 后的路径比）
+    ///
+    /// - 命中后由服务器直接回 200 / 206（单段 Range）/ 416，**不进 router**；
+    /// - body 按 64 KiB 分块从磁盘读，不把文件读进内存（适合音频/视频这类大文件）；
+    /// - `contentType` 为空时按扩展名猜（猜不到给 `application/octet-stream`）；
+    /// - 响应一律 `Connection: close`：大文件传输中途可能被客户端断开，不复用连接更干净。
+    ///
+    /// 用处：把播放器打不开的东西变成普通 `http://` 地址（远程数据 / 私有协议 / 转码产物）。
+    void enableFileRoute(
+        std::string_view path,
+        std::string_view filePath,
+        std::string_view contentType = {}
+    );
+
+    /// 清掉全部静态文件路由
+    void clearFileRoutes();
+
+    /// 置兜底处理器（未注册路由时的请求都给它）；传空函数对象 = 取消
+    void setFallbackHandler(FallbackHandler handler);
 
     /// 在指定 executor 上启动 accept 循环而不创建线程。
     /// 调用方负责运行 io_context。适用于单线程服务模式 (如 agent 服务)。
@@ -329,6 +374,17 @@ private:
     /// startAsync 模式的 accept 循环 — 所有连接在同一 executor 上服务
     asio::awaitable<void> acceptLoopAsync();
 
+    // -----------------------------------------------------------------------
+    // 活跃连接跟踪 — stop() 要把还活着的连接一起关掉
+    // （保持连接的客户端会复用同一条 socket，不关的话服务停了还能继续发请求）
+    // -----------------------------------------------------------------------
+
+    void trackConnection(const std::shared_ptr<boost::beast::tcp_stream>& stream);
+
+    void untrackConnection(const std::shared_ptr<boost::beast::tcp_stream>& stream);
+
+    void closeTrackedConnections();
+
     /// 服务一条 TCP 连接 (成员协程 — 避免悬挂的 lambda 捕获)
     asio::awaitable<void> serveTcp(std::shared_ptr<boost::beast::tcp_stream> stream);
 
@@ -336,8 +392,178 @@ private:
     // 会话处理器 (模板 — 兼容 tcp_stream)
     // -----------------------------------------------------------------------
 
+    /// 静态文件路由条目 (精确匹配路径)
+    struct FileRouteEntry {
+        std::string path;
+        std::string filePath;
+        std::string contentType;
+    };
+
+    /// 静态文件路由的实现: 自己写完整响应（头 + 分块 body），返回 true 表示已处理
+    ///
+    /// - 只支持单段 `Range`（`bytes=a-b` / `bytes=a-` / `bytes=-N`），多段或语法不对时
+    ///   当没有 Range 回 200；
+    /// - 起点越界、后缀长度为 0 回 416（带 `Content-Range: bytes */总长`）；
+    /// - `HEAD` 只写头（Content-Length 保留），不写 body；
+    /// - 文件打不开返回 false，调用方继续走 router（最终 404）。
     template<typename Stream>
-    asio::awaitable<void> serve(Stream stream) {
+    asio::awaitable<bool> serveFileRoute(
+        Stream&               stream,
+        Request&              req,
+        Response&             resp,
+        const FileRouteEntry& route
+    ) {
+        namespace http = boost::beast::http;
+        std::ifstream file(route.filePath, std::ios::binary);
+        if (!file) {
+            co_return false;
+        }
+        file.seekg(0, std::ios::end);
+        const auto     endPos = file.tellg();
+        const uint64_t total  = endPos > 0 ? static_cast<uint64_t>(endPos) : 0;
+        file.seekg(0, std::ios::beg);
+
+        const bool       head   = req.method() == http::verb::head;
+        uint64_t         offset = 0;
+        uint64_t         length = total;
+        http::status     status = http::status::ok;
+
+        auto reply416 = [&]() -> asio::awaitable<bool> {
+            resp.version(req.version());
+            resp.result(http::status::range_not_satisfiable);
+            resp.set(http::field::content_range, fmt::format("bytes */{}", total));
+            resp.body().clear();
+            resp.keep_alive(false);
+            resp.prepare_payload();
+            co_await http::async_write(
+                stream,
+                resp,
+                asio::cancel_after(config_.requestTimeout, asio::use_awaitable)
+            );
+            co_return true;
+        };
+
+        const auto rangeHeader = req[http::field::range];
+        if (!rangeHeader.empty() && total > 0) {
+            std::string_view text{rangeHeader.data(), rangeHeader.size()};
+            // 多段 Range 不支持: 按整个文件回 200 (RFC 7233 允许忽略 Range)
+            if (text.starts_with("bytes=") && text.find(',') == std::string_view::npos) {
+                const auto spec = text.substr(6);
+                const auto dash = spec.find('-');
+                if (dash != std::string_view::npos) {
+                    const auto head_ = spec.substr(0, dash);
+                    const auto tail_ = spec.substr(dash + 1);
+                    bool       ok    = false;
+                    if (head_.empty()) {
+                        // `bytes=-N`: 取末尾 N 字节 (播放器读尾部元数据会这么发)
+                        uint64_t   suffix = 0;
+                        const auto parsed = std::from_chars(
+                            tail_.data(),
+                            tail_.data() + tail_.size(),
+                            suffix
+                        );
+                        if (!tail_.empty() && parsed.ec == std::errc{}) {
+                            // RFC 7233: 后缀长度为 0 不可满足
+                            if (suffix == 0) {
+                                co_return co_await reply416();
+                            }
+                            ok     = true;
+                            offset = suffix >= total ? 0 : total - suffix;
+                            length = total - offset;
+                        }
+                    } else {
+                        uint64_t   start = 0;
+                        uint64_t   end   = total - 1;
+                        const auto parsed = std::from_chars(
+                            head_.data(),
+                            head_.data() + head_.size(),
+                            start
+                        );
+                        ok = parsed.ec == std::errc{};
+                        if (ok && !tail_.empty()) {
+                            const auto parsedEnd = std::from_chars(
+                                tail_.data(),
+                                tail_.data() + tail_.size(),
+                                end
+                            );
+                            ok = parsedEnd.ec == std::errc{} && end >= start;
+                        }
+                        if (ok) {
+                            if (start >= total) {
+                                co_return co_await reply416();
+                            }
+                            if (end >= total) {
+                                end = total - 1;
+                            }
+                            offset = start;
+                            length = end - start + 1;
+                        }
+                    }
+                    if (ok) {
+                        status = http::status::partial_content;
+                    }
+                }
+            }
+        }
+
+        // 记录给调用方 (访问日志 / 统计)
+        resp.result(status);
+
+        http::response<http::empty_body> header;
+        header.version(req.version());
+        header.result(status);
+        header.set(http::field::server, utilxx_base::productToken());
+        header.set(http::field::date, formatHttpDate(std::time(nullptr)));
+        header.set(
+            http::field::content_type,
+            route.contentType.empty() ? "application/octet-stream" : route.contentType
+        );
+        header.set(http::field::accept_ranges, "bytes");
+        header.set(http::field::content_length, std::to_string(length));
+        if (status == http::status::partial_content) {
+            header.set(
+                http::field::content_range,
+                fmt::format("bytes {}-{}/{}", offset, offset + length - 1, total)
+            );
+        }
+        // 大文件传一半客户端跑了很常见: 不复用连接, 免得下次请求解析错位
+        header.set(http::field::connection, "close");
+        header.keep_alive(false);
+
+        http::response_serializer<http::empty_body> serializer{header};
+        co_await http::async_write_header(
+            stream,
+            serializer,
+            asio::cancel_after(config_.requestTimeout, asio::use_awaitable)
+        );
+        if (head || length == 0) {
+            co_return true;
+        }
+
+        file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        std::vector<char> chunk(64 * 1024);
+        uint64_t          remaining = length;
+        while (remaining > 0) {
+            const auto want = static_cast<std::streamsize>(
+                std::min<uint64_t>(remaining, chunk.size())
+            );
+            file.read(chunk.data(), want);
+            const auto got = file.gcount();
+            if (got <= 0) {
+                break;
+            }
+            co_await asio::async_write(
+                stream,
+                asio::buffer(chunk.data(), static_cast<size_t>(got)),
+                asio::cancel_after(config_.requestTimeout, asio::use_awaitable)
+            );
+            remaining -= static_cast<uint64_t>(got);
+        }
+        co_return true;
+    }
+
+    template<typename Stream>
+    asio::awaitable<void> serve(Stream& stream) {
         namespace http = boost::beast::http;
         utilxx_base::AsioErrorCode ec;
 
@@ -347,6 +573,16 @@ private:
         std::string               readErrorMsg;
         http::status              readErrorStatus = http::status::bad_request;
         size_t                    requestCount    = 0; // 连接级请求计数 (防永久占用)
+        // 对端地址（兜底处理器要告诉调用方请求从哪来）
+        std::string peerText;
+        {
+            utilxx_base::AsioErrorCode peerEc;
+            const auto                 endpoint = stream.socket().remote_endpoint(peerEc);
+            if (!peerEc) {
+                peerText = endpoint.address().to_string() + ":"
+                           + std::to_string(endpoint.port());
+            }
+        }
         // WebSocket 升级后 stream 已被移入 ws stream, 收尾 shutdown 必须跳过
         bool streamMoved = false;
 
@@ -440,6 +676,23 @@ private:
             int         methodIdx = httpMethodIndex(req.method());
             std::string matchedPath;
             bool        handled = false;
+            // 静态文件路由会自己写完整个响应 (含 body), 置真后跳过后面的统一写入
+            bool responseSent = false;
+
+            // 静态文件路由（GET / HEAD）：命中就直接回 200 / 206 / 416, 不进 router
+            if (methodIdx == 0 || methodIdx == 1) {
+                for (const auto& fileRoute : fileRoutes_) {
+                    if (fileRoute.path != path) {
+                        continue;
+                    }
+                    if (co_await serveFileRoute(stream, req, resp, fileRoute)) {
+                        handled      = true;
+                        responseSent = true;
+                        keepAlive    = false;
+                    }
+                    break;
+                }
+            }
 
             // 先检查 SSE 流式路由 (仅 GET)
             if (methodIdx == 0) { // GET
@@ -519,7 +772,7 @@ private:
             }
 
             // 检查 WebSocket 升级 (GET + Upgrade: websocket)
-            if (methodIdx == 0 && !handled && !wsRoutes_.empty()) {
+            if (methodIdx == 0 && !handled && (!wsRoutes_.empty() || wsAny_)) {
                 auto upgradeIt = req.find(http::field::upgrade);
                 if (upgradeIt != req.end()
                     && boost::beast::iequals(upgradeIt->value(), "websocket")) {
@@ -529,7 +782,11 @@ private:
                     auto wsOk = co_await utilxx_base::catchErrorAsync<bool>(
                         [&]() -> asio::awaitable<bool> {
                             auto wsIt = wsRoutes_.find(path);
-                            if (wsIt != wsRoutes_.end()) {
+                            const bool exact = wsIt != wsRoutes_.end();
+                            if (!exact && !wsAny_) {
+                                co_return false;
+                            }
+                            {
                                 streamMoved = true;
                                 boost::beast::websocket::stream<boost::beast::tcp_stream> ws(
                                     std::move(stream)
@@ -546,7 +803,11 @@ private:
                                         asio::use_awaitable
                                     )
                                 );
-                                co_await wsIt->second(ws);
+                                if (exact) {
+                                    co_await wsIt->second(ws);
+                                } else {
+                                    co_await (*wsAny_)(ws, req);
+                                }
                                 co_return true;
                             }
                             co_return false;
@@ -602,6 +863,35 @@ private:
                 }
             }
 
+            if (!handled && fallback_ && *fallback_) {
+                handled = co_await utilxx_base::catchErrorAsync<bool>(
+                    [&]() -> asio::awaitable<bool> {
+                        co_await (*fallback_)(
+                            req,
+                            resp,
+                            std::string_view{path},
+                            std::string_view{peerText}
+                        );
+                        co_return true;
+                    },
+                    [&](std::string errInfo) -> asio::awaitable<bool> {
+                        XX_LOGE(
+                            "[server] Fallback error [{} {}]: {}",
+                            req.method_string(),
+                            req.target(),
+                            errInfo
+                        );
+                        fillError(
+                            resp,
+                            req.version(),
+                            http::status::internal_server_error,
+                            "Internal Server Error"
+                        );
+                        co_return true;
+                    }
+                );
+            }
+
             if (!handled) {
                 std::string dummyPath;
                 // RFC 7231 §6.5.5: 405 响应必须携带 Allow 头, 列出该资源实际支持的方法
@@ -630,7 +920,9 @@ private:
             // 确保设置了 Content-Length: 必须调用 prepare_payload() —
             // payload_size() 对 string_body 返回 body_.size() (空 body 为 0),
             // 若按条件判断跳过会遗漏 Content-Length 头
-            resp.prepare_payload();
+            if (!responseSent) {
+                resp.prepare_payload();
+            }
 
             // 尊重客户端的 Connection 头: 客户端发了 "close" 则不保持连接
             bool clientClose = req.find(http::field::connection) != req.end()
@@ -641,7 +933,18 @@ private:
             }
             resp.set(http::field::connection, keepAlive ? "keep-alive" : "close");
 
-            // 发送响应
+            // 发送响应（静态文件路由已经自己写过, 不再重复写）
+            if (responseSent) {
+                if (config_.accessLogEnabled) {
+                    XX_LOGI(
+                        "{} {} -> {} (file)",
+                        req.method_string(),
+                        req.target(),
+                        resp.result_int()
+                    );
+                }
+                continue;
+            }
             if (req.method() == http::verb::head) {
                 // HEAD 响应只发送头部 (含 Content-Length), 不发送 body (RFC 7231 §4.3.2);
                 // 发送 body 会使 keep-alive 连接上的后续请求解析错位
@@ -720,6 +1023,10 @@ private:
     std::atomic<size_t>                      activeConnections_{0};
     std::atomic<size_t>                      nextWorker_{0};
 
+    /// 活跃连接（weak: 协程自己结束时连接自然释放，这里只用于停止时统一关掉）
+    std::mutex                                                     connMutex_;
+    std::vector<std::weak_ptr<boost::beast::tcp_stream>>           trackedConns_;
+
     /// SSE 流式路由 (仅 GET) — 按路径索引
     std::unordered_map<
         std::string,
@@ -734,6 +1041,14 @@ private:
 
     /// WebSocket 路由 (GET + Upgrade) — 按路径索引
     std::unordered_map<std::string, WsHandler> wsRoutes_;
+
+    /// 任意路径升级的处理器（空 = 没置）
+    std::shared_ptr<WsRequestHandler> wsAny_;
+
+    std::vector<FileRouteEntry> fileRoutes_;
+
+    /// 兜底处理器（空 = 没置）
+    std::shared_ptr<FallbackHandler> fallback_;
 
     /// 是否 startAsync 模式 (单 executor, 无 worker 线程)
     bool asyncMode_ = false;

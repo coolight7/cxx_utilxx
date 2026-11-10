@@ -5,10 +5,12 @@
 ## 定位
 
 - **用途**: HTTP 客户端与服务端 (Boost.Beast + OpenSSL)、WebSocket 客户端、
-  正则 (HyperScan 或 std::regex)、Aho-Corasick、路由、文本差异、
-  MD5/设备标识
+  插件网络宿主 (HTTP / TCP / WebSocket / UDP 的客户端与服务端 + 按插件隔离,
+  `utilxx/plugin_net_hub.h`)、正则 (HyperScan 或 std::regex)、Aho-Corasick、路由、
+  文本差异、MD5/设备标识
 - **依赖**: `cxx_utilxx_base` (基础件与取消抽象)、Boost (beast/asio, 仅头文件)、
-  OpenSSL、fmt、html2md; 可选 HyperScan (正则加速, 导出接口以库名
+  OpenSSL、fmt、html2md、`cxx_pluginxx` (只有插件网络宿主用它的通用表定义
+  `pluginxx/api/net.h`, 纯头文件); 可选 HyperScan (正则加速, 导出接口以库名
   `PkgConfig::hyperscan` + `hs_runtime` 声明, 具体库由使用方解析)。
   文件异步 I/O 的 io_uring 依赖属 `cxx_utilxx_base` (其 `system.cpp` 使用), 经本库
   的链接接口间接传递
@@ -26,7 +28,9 @@ include/utilxx/
   http_client.h  http_header.h  http_error.h  http_server.h  ws_client.h
   router.h  regex.h  aho_corasick.h
   diff_util.h  crypto.h
-src/                    实现 (crypto/http_client/http_header/http_server/regex/ws_client)
+  plugin_net_hub.h  plugin_net_hub_tls.h   # 插件网络宿主 (实现插件框架的 <应用名>.net 表)
+src/                    实现 (crypto/http_client/http_header/http_server/regex/ws_client
+                        /plugin_net_hub/plugin_net_hub_tls)
 ```
 
 ## 构建与使用
@@ -64,8 +68,21 @@ auto resp = co_await utilxx::HttpClient::postAsync(url, body, "application/json"
 auto json = resp.bodyJson();          // std::optional<utilxx_base::Json>
 ```
 
-## 子进程相关
+## 关停与关闭语义（实测过、容易踩的）
 
+- `HttpServer::stop()` 除了关监听端口，还会关掉已建立的连接。只关 acceptor 的话，客户端
+  复用的 keep-alive 连接会接着发请求，服务看起来“停不掉”。连接表用 weak_ptr，协程自己结束时
+  自动出表。
+- `HttpServer::serve()` 必须按引用接 stream。按值接会把 socket 移进协程参数，`serveTcp`
+  手里那个 `tcp_stream` 已经是搬空的，关它没有作用。
+- 连接协程用 `weak_from_this()` 抱住服务对象（只在使用方用 `make_shared` 构造时生效），
+  否则 `stop()` 叫醒协程时对象可能已经销毁。
+- `TcpConnection::abort()` 先 `cancel()` 再 `close()`：Windows 上带挂起读的 `closesocket`
+  会把连接重置，已经写进发送缓冲的数据客户端收不到（表现是少收一截，截断位置常落在
+  16 KiB 的整数倍）。
+- 静态文件路由的 `Range` 支持 `bytes=a-b` / `bytes=a-` / `bytes=-N`（后缀长度为 0 回 416）。
+
+## 子进程相关
 HTTP 客户端的 DNS 解析在阻塞路径上工作, 调用方应经 `utilxx::offloadAsync` /
 offloadCancellableAsync 卸载到线程池, 避免阻塞 io_context 线程; 取消语义统一经
 `utilxx::CancelToken` (见 `cxx_utilxx_base`)。
