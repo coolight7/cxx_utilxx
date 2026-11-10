@@ -20,6 +20,8 @@
 #include "utilxx/udp.h"
 #include "utilxx/ws_client.h"
 
+#include "html2md/html2md.h"
+
 
 #include "utilxx_base/asio_error.h"
 #include "utilxx_base/json.h"
@@ -2227,6 +2229,8 @@ struct HttpRequestTask : std::enable_shared_from_this<HttpRequestTask> {
   HttpMode mode = HttpMode::Request;
   /// fetch 的 bytes 形态才需要 bodyBase64
   bool wantBase64 = true;
+  /// 正文形态：空 = 原样；`markdown` = HTML 转 Markdown（结果 `body` 就是 Markdown）
+  std::string format;
 
   /// download: 落盘位置（目录由 startHttpRequest 准备好）
   std::string downloadDir;
@@ -2356,6 +2360,14 @@ struct HttpRequestTask : std::enable_shared_from_this<HttpRequestTask> {
       failFromLibrary(result.error());
       co_return;
     }
+    if (format == "markdown") {
+      // HTML 转 Markdown: 与 `HttpClient::fetchMarkdown` 同一套选项（不额外拆行）
+      auto options = html2md::Options{
+          .splitLines = false,
+      };
+      auto convert = html2md::Converter{result->body, &options};
+      result->body = convert.convert();
+    }
     completeResponse(*result);
   }
 
@@ -2395,6 +2407,9 @@ struct HttpRequestTask : std::enable_shared_from_this<HttpRequestTask> {
     out["redirects"] = redirects;
     out["elapsedMs"] = nowMs() - startedAtMs;
     out["bodyBytes"] = bodyBytes;
+    if (!format.empty()) {
+      out["format"] = format;
+    }
     if (wantBase64) {
       out["bodyBase64"] = utilxx_base::base64Encode(response.body);
     }
@@ -2590,6 +2605,16 @@ bool PluginNetHub::Impl::startHttpRequest(const std::string &plugin,
 
   // TLS 选项 (https 才用得到)
   parseTlsOptions(args, client->tls);
+
+  // 正文形态: `markdown` 时把 HTML 转成 Markdown (只对 request / fetch 有意义)
+  const std::string format = args.value("format", std::string{});
+  if (!format.empty() && format != "markdown") {
+    out = errorJson("bad_args", "format 只支持 markdown（不给就是原样）");
+    return false;
+  }
+  if (static_cast<HttpMode>(mode) != HttpMode::Download) {
+    client->format = format;
+  }
 
   // 结果形态
   if (client->mode == HttpMode::Fetch) {
