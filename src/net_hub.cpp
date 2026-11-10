@@ -1,18 +1,18 @@
-/// 插件网络能力实现: HTTP / TCP / WebSocket / UDP
+/// 网络能力实现: HTTP / TCP / WebSocket / UDP
 ///
-/// 设计与安全边界见 plugin_net_hub.h。文件结构:
+/// 设计与安全边界见 net_hub.h。文件结构:
 /// 1) 公共小工具 (URL / 头解析 / 正文解码 / base64 / SHA-1 / UTF-8 校验);
 /// 2) `Stream`: 一条连接的读写与背压 (其余连接类型都继承它);
-/// 3) `PluginNetHub::Impl`: 服务表、连接表、HTTP 待回答表与操作分发;
+/// 3) `NetHub::Impl`: 服务表、连接表、HTTP 待回答表与操作分发;
 /// 4) HTTP 客户端 / HTTP 服务端 / TCP / WebSocket 四组实现;
 /// 5) 对外 (同步 / 异步 / 取消 / 卸载) 入口。
 ///
 /// 线程: 全部 socket 状态只在网络线程上访问; 对外入口投递到网络线程并**有界等待**
-/// (网络线程不会等插件框架线程, 所以不会互锁)。
+/// (网络线程不会等调用方线程, 所以不会互锁)。
 
-#include "utilxx/plugin_net_hub.h"
+#include "utilxx/net_hub.h"
 
-#include "utilxx/plugin_net_hub_tls.h"
+#include "utilxx/net_hub_tls.h"
 
 #include "utilxx/http_client.h"
 #include "utilxx/http_server.h"
@@ -126,15 +126,15 @@ constexpr size_t kMaxStaticRoutes = 1024;
 constexpr int64_t kMaxStaticBytes = 8 * 1024 * 1024;
 /// 静态路由 URL 尾段里的文件名长度上限 (只用于展示)
 constexpr size_t kMaxStaticFileName = 120;
-/// 每个插件最多几个同类服务
+/// 每个属主最多几个同类服务
 constexpr int32_t kMaxServersPerKind = 8;
-/// 每个插件最多几条连接 (客户端 + 服务端)
-constexpr size_t kMaxConnectionsPerPlugin = 64;
-/// 每个插件最多几个 UDP 通道 (每个通道一个 socket, 防止把进程 fd 用完)
-constexpr size_t kMaxUdpChannelsPerPlugin = 32;
-/// 每个插件同时进行的 HTTP 客户端请求
-constexpr size_t kMaxHttpClientsPerPlugin = 16;
-/// 每个 HTTP 服务同时等待插件回答的请求
+/// 每个属主最多几条连接 (客户端 + 服务端)
+constexpr size_t kMaxConnectionsPerOwner = 64;
+/// 每个属主最多几个 UDP 通道 (每个通道一个 socket, 防止把进程 fd 用完)
+constexpr size_t kMaxUdpChannelsPerOwner = 32;
+/// 每个属主同时进行的 HTTP 客户端请求
+constexpr size_t kMaxHttpClientsPerOwner = 16;
+/// 每个 HTTP 服务同时等待属主回答的请求
 constexpr size_t kMaxHttpPendingPerServer = 64;
 /// HTTP 客户端默认超时
 constexpr int64_t kDefaultHttpTimeoutMs = 15000;
@@ -717,24 +717,24 @@ struct SyncSlot {
 
 } // namespace
 
-/// `PluginNetHub::Impl` 已在 plugin_net_hub.h 里声明过 (嵌套类型), 这里不需要也不该再前置声明:
-/// `struct PluginNetHub::Impl;` 这种带限定名的写法在 clang 上是错误
+/// `NetHub::Impl` 已在 net_hub.h 里声明过 (嵌套类型), 这里不需要也不该再前置声明:
+/// `struct NetHub::Impl;` 这种带限定名的写法在 clang 上是错误
 /// ("forward declaration of struct cannot have a nested name specifier"),
 /// MSVC / GCC 能容忍它, 所以 Android / iOS 构建才会把它报出来。
 
 /// 一条 TCP 连接 (客户端或服务端接受的那一端)
 struct Stream : std::enable_shared_from_this<Stream> {
   /// 接管库的一条 TCP 连接（发送队列、暂停、事件与 WebSocket 那条路一致）
-  Stream(std::shared_ptr<PluginNetHub::Impl> hub,
+  Stream(std::shared_ptr<NetHub::Impl> hub,
          std::shared_ptr<utilxx::TcpConnection> connection);
 
   /// 接管库的一条 WebSocket 连接（握手已完成）
-  Stream(std::shared_ptr<PluginNetHub::Impl> hub,
+  Stream(std::shared_ptr<NetHub::Impl> hub,
          std::shared_ptr<utilxx::WsClient> connection);
   virtual ~Stream() = default;
 
-  std::shared_ptr<PluginNetHub::Impl> hub;
-  std::string plugin;
+  std::shared_ptr<NetHub::Impl> hub;
+  std::string owner;
   std::string id;
   std::string serverId; ///< 空 = 客户端连接
   std::string remote;
@@ -758,7 +758,7 @@ struct Stream : std::enable_shared_from_this<Stream> {
   bool writing = false;
   bool closing = false;
   bool closeWhenFlushed = false;
-  /// 暂停读 (不再产生 data 事件)。用于插件自己做背压: 接收端写不动时先暂停上游。
+  /// 暂停读 (不再产生 data 事件)。用于属主自己做背压: 接收端写不动时先暂停上游。
   bool paused = false;
   /// 是否已经有一个读在飞 (暂停/恢复靠它判断要不要重新排读)
   bool reading = false;
@@ -777,7 +777,7 @@ struct Stream : std::enable_shared_from_this<Stream> {
 
   /// WebSocket 用: 带帧类型的发送（`opcode`: 1 文本 / 2 二进制 / 9 ping）
   void sendWs(int32_t opcode, std::string data, std::string &err);
-  /// 关连接：队列里还有没写出去的字节时先写完（插件“发完最后一段就 close”很常见）
+  /// 关连接：队列里还有没写出去的字节时先写完（属主“发完最后一段就 close”很常见）
   void requestClose();
   void flushThenClose();
   void closeStream(std::string_view reason, std::string_view error);
@@ -819,7 +819,7 @@ enum class HttpMode : int32_t { Request = 0, Fetch = 1, Download = 2 };
 
 /* ==================== 网络中心 ==================== */
 
-struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
+struct NetHub::Impl : std::enable_shared_from_this<NetHub::Impl> {
   PublishFn publish;
   PostFn postToFramework;
 
@@ -830,14 +830,14 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   std::atomic<bool> running{false};
   std::atomic<int64_t> nextRequestId{1};
   std::atomic<int64_t> nextConnSeq{1};
-  /// 插件私有数据根目录 (http.download 落盘用; 在 start() 之前设)
+  /// 属主私有数据根目录 (http.download 落盘用; 在 start() 之前设)
   std::string dataDir;
 
   /// 一个服务 (HTTP / TCP / WS)
   struct Server {
     /// 一条静态路由: 命中后由框架直接回答, **不发 `http.request` 事件**
     ///
-    /// 原先另有一个"插件本地 HTTP 文件服务"（脚本侧的 serve 系列）。它已经并到这里:
+    /// 原先另有一个"属主本地 HTTP 文件服务"（脚本侧的 serve 系列）。它已经并到这里:
     /// 同一个 HTTP 服务里既能自己回答请求, 也能挂几个文件 / 内存内容。
     struct StaticRoute {
       std::string path;        ///< 请求路径 (以 / 开头; 自动生成的带 token 段)
@@ -849,7 +849,7 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
       int64_t mtimeMs = 0; ///< 文件登记时的修改时间 (内存内容为 0)
     };
 
-    std::string plugin;
+    std::string owner;
     std::string kind; ///< http | tcp | ws
     std::string id;
     std::string host;
@@ -860,7 +860,7 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
     int64_t maxBody = kMaxHttpBody;
     int32_t requestTimeoutMs = 30000;
     int32_t maxConnections = 32;
-    size_t pending = 0;          ///< 正在等插件回答的 HTTP 请求数
+    size_t pending = 0;          ///< 正在等属主回答的 HTTP 请求数
     std::set<std::string> conns; ///< 该服务下的连接 id
     std::string url;             ///< http://host:port (只对 http / ws 有意义)
     /// 静态路由 (HTTP 服务专用; 按登记顺序匹配)
@@ -871,20 +871,20 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
     std::shared_ptr<utilxx::TcpServer> tcp;
   };
 
-  std::map<std::string, std::shared_ptr<Server>> servers; ///< plugin|kind|id
-  std::map<std::string, std::shared_ptr<Stream>> conns;   ///< plugin|id
+  std::map<std::string, std::shared_ptr<Server>> servers; ///< owner|kind|id
+  std::map<std::string, std::shared_ptr<Stream>> conns;   ///< owner|id
 
   /// UDP 通道 (广播 / 组播 / 单播都走它; 一个通道 = 一个 socket)
-  std::map<std::string, std::shared_ptr<UdpChannel>> udpChannels; ///< plugin|id
+  std::map<std::string, std::shared_ptr<UdpChannel>> udpChannels; ///< owner|id
 
-  /// 一条等插件回答的 HTTP 请求（handler 协程在这里等，`http.respond` 叫醒它）
+  /// 一条等属主回答的 HTTP 请求（handler 协程在这里等，`http.respond` 叫醒它）
   struct PendingResponse {
-    Json payload;    ///< 插件给的响应（`answered` 为真时有效）
+    Json payload;    ///< 属主给的响应（`answered` 为真时有效）
     bool answered = false;
     std::shared_ptr<asio::steady_timer> timer;
   };
   struct PendingHttp {
-    std::string plugin;
+    std::string owner;
     std::string serverKey;
     std::shared_ptr<PendingResponse> wait;
   };
@@ -892,7 +892,7 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
 
   /// 进行中的 HTTP 客户端请求
   struct HttpWait {
-    std::string plugin;
+    std::string owner;
     DoneFn done;
     std::shared_ptr<HttpRequestTask> client;
   };
@@ -900,20 +900,20 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
 
   /* ---------- 小工具 ---------- */
 
-  static std::string serverKeyOf(const std::string &plugin,
+  static std::string serverKeyOf(const std::string &owner,
                                  const std::string &kind,
                                  const std::string &id) {
-    return plugin + "|" + kind + "|" + id;
+    return owner + "|" + kind + "|" + id;
   }
-  static std::string connKeyOf(const std::string &plugin,
+  static std::string connKeyOf(const std::string &owner,
                                const std::string &id) {
-    return plugin + "|" + id;
+    return owner + "|" + id;
   }
 
-  /// 发一条插件网络事件 (`payload` 里要带 `kind`)
-  void emit(const std::string &pluginId, Json payload) {
+  /// 发一条网络事件 (`payload` 里要带 `kind`)
+  void emit(const std::string &ownerId, Json payload) {
     if (publish) {
-      publish(pluginId, payload.dump());
+      publish(ownerId, payload.dump());
     }
   }
 
@@ -939,10 +939,10 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
 
   /* ---------- 连接与服务记账 ---------- */
 
-  size_t connectionCountOf(const std::string &plugin) const {
+  size_t connectionCountOf(const std::string &owner) const {
     size_t count = 0;
     for (const auto &item : conns) {
-      if (item.second && item.second->plugin == plugin) {
+      if (item.second && item.second->owner == owner) {
         ++count;
       }
     }
@@ -956,7 +956,7 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   void onStreamClosed(const std::shared_ptr<Stream> &stream);
 
   /// 取连接 (只能网络线程)
-  std::shared_ptr<Stream> findConn(const std::string &plugin,
+  std::shared_ptr<Stream> findConn(const std::string &owner,
                                    const std::string &id) const;
 
   /// 起一个监听; 失败写 err
@@ -982,7 +982,7 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   asio::awaitable<void> onTcpAccepted(const std::shared_ptr<Server> &server,
                                       std::shared_ptr<utilxx::TcpConnection> conn);
 
-  /// 一条 HTTP 请求的兑底处理：静态内存路由 -> 插件回答 -> 504
+  /// 一条 HTTP 请求的兑底处理：静态内存路由 -> 属主回答 -> 504
   asio::awaitable<void> handleHttpRequest(
       const std::shared_ptr<Server> &server,
       utilxx::HttpServer::Request &req,
@@ -992,11 +992,11 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   /// 把静态路由同步给库的服务（文件走 `enableFileRoute`，内存内容在兑底里比对）
   void rebuildHttpFileRoutes(const Server &server);
 
-  /// 关掉某个插件的全部服务与连接 (网络线程; 卸载 / 停机)
+  /// 关掉某个属主的全部服务与连接 (网络线程; 卸载 / 停机)
   ///
   /// `cancelled` 非空时收走未完成 HTTP 客户端请求的完成回调 —— 它们要靠调用方
-  /// 在插件框架线程上按"已取消"结算 (网络线程不能执行插件代码)。
-  void closeAllOf(const std::string &plugin, bool allPlugins,
+  /// 在调用方线程上按"已取消"结算 (网络线程不能执行属主代码)。
+  void closeAllOf(const std::string &owner, bool allOwners,
                   std::vector<DoneFn> *cancelled = nullptr);
 
   /* ---------- HTTP 静态内容 (文件 / 内存) ---------- */
@@ -1022,15 +1022,15 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   void startThread();
   void stopThread();
 
-  /* ---------- HTTP 服务端 (等插件回答的请求) ---------- */
+  /* ---------- HTTP 服务端 (等属主回答的请求) ---------- */
 
   /// 登记一个等待回答的请求; 超出上限返回 0
   int64_t registerPendingHttp(const std::shared_ptr<Server> &server,
                               const std::shared_ptr<PendingResponse> &wait);
   std::shared_ptr<PendingResponse> takePendingHttp(int64_t requestId,
-                                                   std::string *plugin);
+                                                   std::string *owner);
   void dropPendingHttp(int64_t requestId);
-  /// 叫醒某个服务下所有等回答的请求（服务停了 / 插件卸载了）
+  /// 叫醒某个服务下所有等回答的请求（服务停了 / 属主卸载了）
   void wakePendingOfServer(const std::string &serverKey);
 
   /* ---------- HTTP 客户端 ---------- */
@@ -1038,51 +1038,51 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   /// 开始一个 HTTP 请求 (网络线程); 失败时 out 写错误对象并返回 false
   ///
   /// `mode`: 0 = http.request / 1 = http.fetch / 2 = http.download
-  bool startHttpRequest(const std::string &plugin, int64_t requestId,
+  bool startHttpRequest(const std::string &owner, int64_t requestId,
                         const Json &args, DoneFn done, Json &out,
                         int32_t mode = 0);
 
   /// 完成一个 HTTP 客户端请求 (成功与失败都走这里)
   void finishHttpRequest(int64_t requestId, bool ok, Json payload);
 
-  void cancelHttpRequest(const std::string &plugin, int64_t requestId,
+  void cancelHttpRequest(const std::string &owner, int64_t requestId,
                          Json &out);
 
   /* ---------- 服务与连接操作 (网络线程) ---------- */
 
-  int32_t handleCall(const std::string &plugin, const std::string &op,
+  int32_t handleCall(const std::string &owner, const std::string &op,
                      const Json &args, Json &out);
 
-  void stopServers(const std::string &plugin, const std::string &kind,
+  void stopServers(const std::string &owner, const std::string &kind,
                    const std::string &id, Json &out);
-  void closeConn(const std::string &plugin, const std::string &id, Json &out);
-  void sendConn(const std::string &plugin, const Json &args, Json &out);
-  std::string infoJsonOnThread(const std::string &plugin, bool allPlugins);
+  void closeConn(const std::string &owner, const std::string &id, Json &out);
+  void sendConn(const std::string &owner, const Json &args, Json &out);
+  std::string infoJsonOnThread(const std::string &owner, bool allOwners);
 
   /* ---------- UDP 通道 (网络线程) ---------- */
 
   /// `udp.open`: 建通道并开始收包（失败写 out 并返回 false）
-  bool openUdp(const std::string &plugin, const Json &args, Json &out);
+  bool openUdp(const std::string &owner, const Json &args, Json &out);
 
   /// `udp.send`: 发一个包给目标地址（可以发给广播地址 / 组播组）
-  void sendUdp(const std::string &plugin, const Json &args, Json &out);
+  void sendUdp(const std::string &owner, const Json &args, Json &out);
 
   /// `udp.join` / `udp.leave`: 加入 / 退出组播组
-  bool groupUdp(const std::string &plugin, const Json &args, bool join,
+  bool groupUdp(const std::string &owner, const Json &args, bool join,
                 Json &out);
 
   /// `udp.close`: 关一个通道
-  void closeUdp(const std::string &plugin, const std::string &id, Json &out);
+  void closeUdp(const std::string &owner, const std::string &id, Json &out);
 
-  /// 关掉某个插件的全部 UDP 通道（卸载 / 停机；网络线程）
-  void closeUdpOf(const std::string &plugin, bool allPlugins);
+  /// 关掉某个属主的全部 UDP 通道（卸载 / 停机；网络线程）
+  void closeUdpOf(const std::string &owner, bool allOwners);
 
   /// 关掉一个通道并发 `udp.closed` 事件
   void shutdownUdp(const std::shared_ptr<UdpChannel> &channel,
                    const char *reason);
 
   /// `udp` 自省数据（`net.info` 用）
-  Json udpInfoJson(const std::string &plugin, bool allPlugins) const;
+  Json udpInfoJson(const std::string &owner, bool allOwners) const;
 
   /// 一个服务的静态路由清单 (`http.serve` / `http.route` / info 共用同一份)
   Json staticRoutesJson(const Server &server) const;
@@ -1091,13 +1091,13 @@ struct PluginNetHub::Impl : std::enable_shared_from_this<PluginNetHub::Impl> {
   std::string staticBaseUrl(const Server &server) const;
 
   /// 当前是否在监听这个地址 (服务端存在且监听中)
-  std::shared_ptr<Server> findServer(const std::string &plugin,
+  std::shared_ptr<Server> findServer(const std::string &owner,
                                      const std::string &kind,
                                      const std::string &id) const;
 
-  std::string nextServerId(const std::string &plugin,
+  std::string nextServerId(const std::string &owner,
                            const std::string &kind) const;
-  std::string nextConnId(const std::string &plugin,
+  std::string nextConnId(const std::string &owner,
                          const std::string &prefix) const;
 };
 
@@ -1139,7 +1139,7 @@ bool resolveBindHost(std::string &host, std::string &err) {
 
 /* ==================== Stream ==================== */
 
-Stream::Stream(std::shared_ptr<PluginNetHub::Impl> hubRef,
+Stream::Stream(std::shared_ptr<NetHub::Impl> hubRef,
                std::shared_ptr<utilxx::TcpConnection> connection)
     : hub(std::move(hubRef)), tcpConn(std::move(connection)) {
   // 库的连接已经建好, 对端 / 本地地址直接问它
@@ -1149,7 +1149,7 @@ Stream::Stream(std::shared_ptr<PluginNetHub::Impl> hubRef,
   }
 }
 
-Stream::Stream(std::shared_ptr<PluginNetHub::Impl> hubRef,
+Stream::Stream(std::shared_ptr<NetHub::Impl> hubRef,
                std::shared_ptr<utilxx::WsClient> connection)
     : hub(std::move(hubRef)), wsClient(std::move(connection)) {}
 
@@ -1176,7 +1176,7 @@ void Stream::startRead() {
   reading = true;
   auto self = shared_from_this();
   if (wsClient) {
-    // 库的 WebSocket: 一条 recv 协程接一条（关闭帧与错误都在这里落地）
+    // 库的 WebSocket: 一条 recv 协程接一条（关闭帧与错误都在这里处理）
     asio::co_spawn(
         hub->io.get_executor(),
         [self]() -> asio::awaitable<void> {
@@ -1423,22 +1423,22 @@ void Stream::closeStream(std::string_view reason, std::string_view error) {
 /* ==================== 记账 ==================== */
 
 std::shared_ptr<Stream>
-PluginNetHub::Impl::findConn(const std::string &plugin,
+NetHub::Impl::findConn(const std::string &owner,
                              const std::string &id) const {
-  const auto it = conns.find(connKeyOf(plugin, id));
+  const auto it = conns.find(connKeyOf(owner, id));
   return it == conns.end() ? nullptr : it->second;
 }
 
-bool PluginNetHub::Impl::registerStream(const std::shared_ptr<Stream> &stream) {
+bool NetHub::Impl::registerStream(const std::shared_ptr<Stream> &stream) {
   if (!stream) {
     return false;
   }
-  if (connectionCountOf(stream->plugin) >= kMaxConnectionsPerPlugin) {
+  if (connectionCountOf(stream->owner) >= kMaxConnectionsPerOwner) {
     return false;
   }
-  conns[connKeyOf(stream->plugin, stream->id)] = stream;
+  conns[connKeyOf(stream->owner, stream->id)] = stream;
   if (!stream->serverId.empty()) {
-    const auto server = findServer(stream->plugin, stream->kind(), stream->serverId);
+    const auto server = findServer(stream->owner, stream->kind(), stream->serverId);
     if (server) {
       server->conns.insert(stream->id);
     }
@@ -1446,46 +1446,46 @@ bool PluginNetHub::Impl::registerStream(const std::shared_ptr<Stream> &stream) {
   return true;
 }
 
-void PluginNetHub::Impl::onStreamClosed(const std::shared_ptr<Stream> &stream) {
+void NetHub::Impl::onStreamClosed(const std::shared_ptr<Stream> &stream) {
   if (!stream) {
     return;
   }
-  const auto it = conns.find(connKeyOf(stream->plugin, stream->id));
+  const auto it = conns.find(connKeyOf(stream->owner, stream->id));
   if (it != conns.end() && it->second == stream) {
     conns.erase(it);
   }
   if (!stream->serverId.empty()) {
-    const auto server = findServer(stream->plugin, stream->kind(), stream->serverId);
+    const auto server = findServer(stream->owner, stream->kind(), stream->serverId);
     if (server) {
       server->conns.erase(stream->id);
     }
   }
 }
 
-std::shared_ptr<PluginNetHub::Impl::Server>
-PluginNetHub::Impl::findServer(const std::string &plugin,
+std::shared_ptr<NetHub::Impl::Server>
+NetHub::Impl::findServer(const std::string &owner,
                                const std::string &kind,
                                const std::string &id) const {
-  const auto it = servers.find(serverKeyOf(plugin, kind, id));
+  const auto it = servers.find(serverKeyOf(owner, kind, id));
   return it == servers.end() ? nullptr : it->second;
 }
 
-std::string PluginNetHub::Impl::nextServerId(const std::string &plugin,
+std::string NetHub::Impl::nextServerId(const std::string &owner,
                                              const std::string &kind) const {
   for (int i = 1; i < 10000; ++i) {
     const std::string candidate = kind + std::to_string(i);
-    if (!findServer(plugin, kind, candidate)) {
+    if (!findServer(owner, kind, candidate)) {
       return candidate;
     }
   }
   return kind + "_x";
 }
 
-std::string PluginNetHub::Impl::nextConnId(const std::string &plugin,
+std::string NetHub::Impl::nextConnId(const std::string &owner,
                                            const std::string &prefix) const {
   for (int i = 1; i < 100000; ++i) {
     const std::string candidate = prefix + std::to_string(i);
-    if (!findConn(plugin, candidate)) {
+    if (!findConn(owner, candidate)) {
       return candidate;
     }
   }
@@ -1494,11 +1494,11 @@ std::string PluginNetHub::Impl::nextConnId(const std::string &plugin,
 
 /* ==================== 监听与接受 ==================== */
 
-bool PluginNetHub::Impl::listenServer(std::shared_ptr<Server> server,
+bool NetHub::Impl::listenServer(std::shared_ptr<Server> server,
                                       std::string &err) {
   int32_t sameKind = 0;
   for (const auto &item : servers) {
-    if (item.second && item.second->plugin == server->plugin &&
+    if (item.second && item.second->owner == server->owner &&
         item.second->kind == server->kind) {
       ++sameKind;
     }
@@ -1547,7 +1547,7 @@ std::filesystem::path pathFromUtf8(const std::string &text) {
 
 } // namespace
 
-bool PluginNetHub::Impl::buildStaticRoute(
+bool NetHub::Impl::buildStaticRoute(
     const Server &server, const Json &args,
     const std::shared_ptr<Server::StaticRoute> &route, std::string &err) {
   const std::string path{trimAscii(args.value("path", std::string{}))};
@@ -1645,7 +1645,7 @@ bool PluginNetHub::Impl::buildStaticRoute(
   return true;
 }
 
-bool PluginNetHub::Impl::addStaticRoute(const std::shared_ptr<Server> &server,
+bool NetHub::Impl::addStaticRoute(const std::shared_ptr<Server> &server,
                                         const Json &args, Json &out) {
   if (!server) {
     out = errorJson("not_found", "服务不存在");
@@ -1705,8 +1705,8 @@ bool PluginNetHub::Impl::addStaticRoute(const std::shared_ptr<Server> &server,
   return true;
 }
 
-std::shared_ptr<PluginNetHub::Impl::Server::StaticRoute>
-PluginNetHub::Impl::findStaticRoute(const Server &server,
+std::shared_ptr<NetHub::Impl::Server::StaticRoute>
+NetHub::Impl::findStaticRoute(const Server &server,
                                     const std::string &path) const {
   for (const auto &route : server.routes) {
     if (route && route->path == path) {
@@ -1716,7 +1716,7 @@ PluginNetHub::Impl::findStaticRoute(const Server &server,
   return nullptr;
 }
 
-bool PluginNetHub::Impl::removeStaticRoute(const std::shared_ptr<Server> &server,
+bool NetHub::Impl::removeStaticRoute(const std::shared_ptr<Server> &server,
                                            const std::string &path) {
   if (!server) {
     return false;
@@ -1748,7 +1748,7 @@ void setSimpleHttpResponse(utilxx::HttpServer::Request &req,
   resp.keep_alive(false);
 }
 
-/// 把插件给的响应（status / headers / body|bodyBase64 / contentType）填进响应
+/// 把属主给的响应（status / headers / body|bodyBase64 / contentType）填进响应
 void fillHttpResponse(utilxx::HttpServer::Request &req,
                       utilxx::HttpServer::Response &resp,
                       const Json &payload) {
@@ -1810,7 +1810,7 @@ void fillHttpResponse(utilxx::HttpServer::Request &req,
 /// 回一条静态内存路由（200 / 206 / 416）；文件内容的静态路由由库直接发
 void setStaticContentResponse(
     utilxx::HttpServer::Request &req, utilxx::HttpServer::Response &resp,
-    const PluginNetHub::Impl::Server::StaticRoute &route) {
+    const NetHub::Impl::Server::StaticRoute &route) {
   namespace http = boost::beast::http;
   const int64_t size = route.size;
   const auto rangeField = req[http::field::range];
@@ -1858,7 +1858,7 @@ std::string httpVersionText(unsigned version) {
 
 } // namespace
 
-bool PluginNetHub::Impl::listenHttpServer(const std::shared_ptr<Server> &server,
+bool NetHub::Impl::listenHttpServer(const std::shared_ptr<Server> &server,
                                           std::string &err) {
   utilxx::HttpServer::Config config;
   config.address = server->host;
@@ -1867,10 +1867,10 @@ bool PluginNetHub::Impl::listenHttpServer(const std::shared_ptr<Server> &server,
       (std::max)(int64_t{1}, static_cast<int64_t>((server->requestTimeoutMs + 999) / 1000))};
   config.maxConnections =
       static_cast<size_t>((std::max)(int32_t{1}, server->maxConnections));
-  // 请求体上限跟着插件给的 maxBodyBytes 走（库超出会自己回 413）
+  // 请求体上限跟着属主给的 maxBodyBytes 走（库超出会自己回 413）
   config.maxRequestBody =
       static_cast<uint64_t>((std::max)(int64_t{0}, server->maxBody));
-  // 插件服务不打访问日志: 网络事件里已经能看出谁请求了什么
+  // 属主服务不打访问日志: 网络事件里已经能看出谁请求了什么
   config.accessLogEnabled = false;
   auto http = std::make_shared<utilxx::HttpServer>(config);
   auto self = shared_from_this();
@@ -1890,12 +1890,12 @@ bool PluginNetHub::Impl::listenHttpServer(const std::shared_ptr<Server> &server,
   server->port = http->port();
   server->url = "http://" + server->host + ":" +
                 std::to_string(server->port) + server->pathPrefix;
-  servers[serverKeyOf(server->plugin, server->kind, server->id)] = server;
+  servers[serverKeyOf(server->owner, server->kind, server->id)] = server;
   rebuildHttpFileRoutes(*server);
   return true;
 }
 
-void PluginNetHub::Impl::rebuildHttpFileRoutes(const Server &server) {
+void NetHub::Impl::rebuildHttpFileRoutes(const Server &server) {
   if (!server.http) {
     return;
   }
@@ -1908,7 +1908,7 @@ void PluginNetHub::Impl::rebuildHttpFileRoutes(const Server &server) {
   }
 }
 
-bool PluginNetHub::Impl::listenTcpServer(const std::shared_ptr<Server> &server,
+bool NetHub::Impl::listenTcpServer(const std::shared_ptr<Server> &server,
                                          std::string &err) {
   utilxx::TcpServer::Config config;
   config.address = server->host;
@@ -1932,11 +1932,11 @@ bool PluginNetHub::Impl::listenTcpServer(const std::shared_ptr<Server> &server,
   }
   server->tcp = tcpServer;
   server->port = tcpServer->port();
-  servers[serverKeyOf(server->plugin, server->kind, server->id)] = server;
+  servers[serverKeyOf(server->owner, server->kind, server->id)] = server;
   return true;
 }
 
-asio::awaitable<void> PluginNetHub::Impl::handleHttpRequest(
+asio::awaitable<void> NetHub::Impl::handleHttpRequest(
     const std::shared_ptr<Server> &server, utilxx::HttpServer::Request &req,
     utilxx::HttpServer::Response &resp, std::string_view path,
     std::string_view peer) {
@@ -1958,7 +1958,7 @@ asio::awaitable<void> PluginNetHub::Impl::handleHttpRequest(
     }
   }
   if (server->staticOnly) {
-    // 这个服务就是拿来发静态内容的：没命中就 404，不去等插件回答
+    // 这个服务就是拿来发静态内容的：没命中就 404，不去等属主回答
     setSimpleHttpResponse(req, resp, http::status::not_found, "没有这条静态路由");
     co_return;
   }
@@ -2011,7 +2011,7 @@ asio::awaitable<void> PluginNetHub::Impl::handleHttpRequest(
     event["body"] = toSafeText(body);
     event["text"] = toSafeText(body);
   }
-  emit(server->plugin, std::move(event));
+  emit(server->owner, std::move(event));
 
   AsioErrorCode ec;
   co_await wait->timer->async_wait(
@@ -2019,15 +2019,15 @@ asio::awaitable<void> PluginNetHub::Impl::handleHttpRequest(
   dropPendingHttp(requestId);
   if (!wait->answered) {
     setSimpleHttpResponse(req, resp, http::status::gateway_timeout,
-                          "插件没有在时限内回答请求");
+                          "属主没有在时限内回答请求");
     co_return;
   }
   fillHttpResponse(req, resp, wait->payload);
 }
 
-/* ==================== HTTP 服务端 (等插件回答) ==================== */
+/* ==================== HTTP 服务端 (等属主回答) ==================== */
 
-int64_t PluginNetHub::Impl::registerPendingHttp(
+int64_t NetHub::Impl::registerPendingHttp(
     const std::shared_ptr<Server> &server,
     const std::shared_ptr<PendingResponse> &wait) {
   if (!server || !wait) {
@@ -2038,22 +2038,22 @@ int64_t PluginNetHub::Impl::registerPendingHttp(
   }
   const int64_t requestId = allocateRequestId();
   PendingHttp pending;
-  pending.plugin = server->plugin;
-  pending.serverKey = serverKeyOf(server->plugin, server->kind, server->id);
+  pending.owner = server->owner;
+  pending.serverKey = serverKeyOf(server->owner, server->kind, server->id);
   pending.wait = wait;
   pendingHttp[requestId] = std::move(pending);
   ++server->pending;
   return requestId;
 }
 
-std::shared_ptr<PluginNetHub::Impl::PendingResponse>
-PluginNetHub::Impl::takePendingHttp(int64_t requestId, std::string *plugin) {
+std::shared_ptr<NetHub::Impl::PendingResponse>
+NetHub::Impl::takePendingHttp(int64_t requestId, std::string *owner) {
   const auto it = pendingHttp.find(requestId);
   if (it == pendingHttp.end()) {
     return nullptr;
   }
-  if (plugin) {
-    *plugin = it->second.plugin;
+  if (owner) {
+    *owner = it->second.owner;
   }
   const auto serverIt = servers.find(it->second.serverKey);
   if (serverIt != servers.end() && serverIt->second &&
@@ -2065,18 +2065,18 @@ PluginNetHub::Impl::takePendingHttp(int64_t requestId, std::string *plugin) {
   return wait;
 }
 
-void PluginNetHub::Impl::dropPendingHttp(int64_t requestId) {
-  std::string plugin;
-  (void)takePendingHttp(requestId, &plugin);
+void NetHub::Impl::dropPendingHttp(int64_t requestId) {
+  std::string owner;
+  (void)takePendingHttp(requestId, &owner);
 }
 
-void PluginNetHub::Impl::wakePendingOfServer(const std::string &serverKey) {
+void NetHub::Impl::wakePendingOfServer(const std::string &serverKey) {
   for (auto it = pendingHttp.begin(); it != pendingHttp.end();) {
     if (it->second.serverKey != serverKey) {
       ++it;
       continue;
     }
-    // 服务停了：让还在等的 handler 回 504 收尾（不算"插件回答过"）
+    // 服务停了：让还在等的 handler 回 504 收尾（不算"属主回答过"）
     if (it->second.wait && it->second.wait->timer) {
       it->second.wait->timer->cancel();
     }
@@ -2084,19 +2084,19 @@ void PluginNetHub::Impl::wakePendingOfServer(const std::string &serverKey) {
   }
 }
 
-/* ==================== 关停某一插件的全部网络资源 ==================== */
+/* ==================== 关停某一属主的全部网络资源 ==================== */
 
-void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
+void NetHub::Impl::closeAllOf(const std::string &owner, bool allOwners,
                                   std::vector<DoneFn> *cancelled) {
   // 1) 服务: 关监听 (之后不再接受新连接)
   for (auto it = servers.begin(); it != servers.end();) {
     if (!it->second ||
-        (allPlugins ? true : it->second->plugin == plugin)) {
+        (allOwners ? true : it->second->owner == owner)) {
       if (it->second->http) {
         // 库的服务: 关监听并叫醒还在等回答的请求（handler 会回 504）
         it->second->http->stop();
         wakePendingOfServer(
-            serverKeyOf(it->second->plugin, it->second->kind, it->second->id));
+            serverKeyOf(it->second->owner, it->second->kind, it->second->id));
       }
       if (it->second->tcp) {
         it->second->tcp->stop();
@@ -2112,18 +2112,18 @@ void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
     if (!item.second) {
       continue;
     }
-    if (allPlugins || item.second->plugin == plugin) {
+    if (allOwners || item.second->owner == owner) {
       closing.push_back(item.second);
     }
   }
   for (const auto &stream : closing) {
-    stream->closeStream("plugin_unloaded", {});
+    stream->closeStream("owner_unloaded", {});
   }
   // 3) UDP 通道: 关 socket (发 udp.closed 事件)
-  closeUdpOf(plugin, allPlugins);
+  closeUdpOf(owner, allOwners);
   // 4) 未回答的 HTTP 请求与未完成的客户端请求
   for (auto it = pendingHttp.begin(); it != pendingHttp.end();) {
-    if (allPlugins || it->second.plugin == plugin) {
+    if (allOwners || it->second.owner == owner) {
       if (it->second.wait && it->second.wait->timer) {
         it->second.wait->timer->cancel();
       }
@@ -2134,8 +2134,8 @@ void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
   }
   std::vector<std::pair<int64_t, std::string>> waits;
   for (auto it = httpWaits.begin(); it != httpWaits.end();) {
-    if (allPlugins || it->second.plugin == plugin) {
-      waits.emplace_back(it->first, it->second.plugin);
+    if (allOwners || it->second.owner == owner) {
+      waits.emplace_back(it->first, it->second.owner);
       if (cancelled && it->second.done) {
         cancelled->push_back(std::move(it->second.done));
       }
@@ -2145,7 +2145,7 @@ void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
     }
   }
   for (const auto &item : waits) {
-    Json event = errorJson("cancelled", "插件已卸载或插件框架已停止");
+    Json event = errorJson("cancelled", "属主已卸载或调用方框架已停止");
     event["kind"] = "http.response";
     event["requestId"] = item.first;
     emit(item.second, std::move(event));
@@ -2155,10 +2155,10 @@ void PluginNetHub::Impl::closeAllOf(const std::string &plugin, bool allPlugins,
 /* ==================== TCP 连接 ==================== */
 
 struct TcpStream : Stream {
-  explicit TcpStream(std::shared_ptr<PluginNetHub::Impl> hubRef)
+  explicit TcpStream(std::shared_ptr<NetHub::Impl> hubRef)
       : Stream(std::move(hubRef), std::shared_ptr<utilxx::TcpConnection>{}) {}
 
-  std::shared_ptr<PluginNetHub::Impl::Server> server;
+  std::shared_ptr<NetHub::Impl::Server> server;
 
   /// 发起连接 (网络线程); 成功发 `socket.connected`, 失败发 `socket.closed`
   void connectTo(std::string host, uint16_t port, int32_t timeoutMs);
@@ -2184,7 +2184,7 @@ struct TcpStream : Stream {
       event["data"] = std::string{view};
     }
     event["bytes"] = static_cast<int64_t>(size);
-    hub->emit(plugin, std::move(event));
+    hub->emit(owner, std::move(event));
   }
 
   void onClosed(std::string_view reason, std::string_view error) override {
@@ -2198,7 +2198,7 @@ struct TcpStream : Stream {
     if (!error.empty()) {
       event["error"] = std::string{error};
     }
-    hub->emit(plugin, std::move(event));
+    hub->emit(owner, std::move(event));
   }
 };
 
@@ -2207,11 +2207,11 @@ struct TcpStream : Stream {
 /// 一次 HTTP 客户端请求（`http.request` / `http.fetch` / `http.download`）
 ///
 /// 协议（建连、TLS、重定向、chunked、正文上限）交给库里的 `utilxx::HttpClient`，
-/// 这里只做三件事：把插件参数换算成请求配置、把结果拼成插件面熟的 JSON、管取消与超时。
+/// 这里只做三件事：把属主参数换算成请求配置、把结果拼成属主面熟的 JSON、管取消与超时。
 /// 整条请求是一条协程，挂在集线器的 io_context 上。
 struct HttpRequestTask : std::enable_shared_from_this<HttpRequestTask> {
-  std::shared_ptr<PluginNetHub::Impl> hub;
-  std::string plugin;
+  std::shared_ptr<NetHub::Impl> hub;
+  std::string owner;
   int64_t requestId = 0;
 
   // 参数（由 startHttpRequest 填好）
@@ -2313,7 +2313,7 @@ struct HttpRequestTask : std::enable_shared_from_this<HttpRequestTask> {
     config.followRedirect =
         followRedirects ? static_cast<size_t>((std::max)(0, maxRedirects)) : 0;
     config.keepAlive = false;
-    // 正文上限：插件给了 maxBytes 就读满停下并标 truncated，不给就整份读进内存
+    // 正文上限：属主给了 maxBytes 就读满停下并标 truncated，不给就整份读进内存
     config.truncateToLimit = maxBytes > 0;
     config.maxResponseBody = maxBytes > 0 ? static_cast<uint64_t>(maxBytes) : 0;
     if (parsed.scheme == "https") {
@@ -2461,7 +2461,7 @@ struct HttpRequestTask : std::enable_shared_from_this<HttpRequestTask> {
     hub->finishHttpRequest(requestId, false, std::move(out));
   }
 
-  /// 库只给错误串，这里按其中的关键字还原成插件面熟的错误码
+  /// 库只给错误串，这里按其中的关键字还原成属主面熟的错误码
   void failFromLibrary(const std::string &message) {
     const std::string lower = lowerAscii(message);
     const auto has = [&lower](std::string_view needle) {
@@ -2535,7 +2535,7 @@ struct HttpRequestTask : std::enable_shared_from_this<HttpRequestTask> {
 
 /* ==================== HTTP 客户端: 中心侧入口 ==================== */
 
-bool PluginNetHub::Impl::startHttpRequest(const std::string &plugin,
+bool NetHub::Impl::startHttpRequest(const std::string &owner,
                                           int64_t requestId, const Json &args,
                                           DoneFn done, Json &out,
                                           int32_t mode) {
@@ -2550,18 +2550,18 @@ bool PluginNetHub::Impl::startHttpRequest(const std::string &plugin,
   }
   size_t active = 0;
   for (const auto &item : httpWaits) {
-    if (item.second.plugin == plugin) {
+    if (item.second.owner == owner) {
       ++active;
     }
   }
-  if (active >= kMaxHttpClientsPerPlugin) {
+  if (active >= kMaxHttpClientsPerOwner) {
     out = errorJson("too_many_requests", "同时在进行的 HTTP 请求过多");
     return false;
   }
 
   auto client = std::make_shared<HttpRequestTask>();
   client->hub = shared_from_this();
-  client->plugin = plugin;
+  client->owner = owner;
   client->requestId = requestId;
   client->url = url;
   client->mode = static_cast<HttpMode>(mode);
@@ -2596,7 +2596,7 @@ bool PluginNetHub::Impl::startHttpRequest(const std::string &plugin,
   const int64_t timeoutMs = args.value("timeoutMs", int64_t{kDefaultHttpTimeoutMs});
   // 超时不再夹区间: `<= 0` = 不设超时
   client->timeoutMs = timeoutMs <= 0 ? int64_t{0} : timeoutMs;
-  // 正文上限不再夹区间: `<= 0` = 不限制（插件自己控制内存）
+  // 正文上限不再夹区间: `<= 0` = 不限制（属主自己控制内存）
   client->maxBytes = args.value("maxBytes", int64_t{0});
   client->followRedirects = args.value("followRedirects", true);
   client->maxRedirects = static_cast<int32_t>(
@@ -2628,12 +2628,12 @@ bool PluginNetHub::Impl::startHttpRequest(const std::string &plugin,
     }
     if (dataDir.empty()) {
       out = errorJson("no_data_dir",
-                      "插件数据目录未就绪 (host_config.data_dir 为空), 不能下载到本地");
+                      "属主数据目录未就绪 (host_config.data_dir 为空), 不能下载到本地");
       return false;
     }
     const std::string fileName =
         downloadFileNameOf(args.value("fileName", std::string{}), url);
-    client->downloadDir = dataDir + "/" + plugin + "/data/downloads";
+    client->downloadDir = dataDir + "/" + owner + "/data/downloads";
     client->downloadFileName = fileName;
     // 目录先建出来; 建不出来就让调用方拿到可读原因
     std::error_code dirEc;
@@ -2646,7 +2646,7 @@ bool PluginNetHub::Impl::startHttpRequest(const std::string &plugin,
   }
 
   HttpWait wait;
-  wait.plugin = plugin;
+  wait.owner = owner;
   wait.done = std::move(done);
   wait.client = client;
   httpWaits[requestId] = std::move(wait);
@@ -2658,7 +2658,7 @@ bool PluginNetHub::Impl::startHttpRequest(const std::string &plugin,
   return true;
 }
 
-void PluginNetHub::Impl::finishHttpRequest(int64_t requestId, bool ok,
+void NetHub::Impl::finishHttpRequest(int64_t requestId, bool ok,
                                            Json payload) {
   const auto it = httpWaits.find(requestId);
   if (it == httpWaits.end()) {
@@ -2678,13 +2678,13 @@ void PluginNetHub::Impl::finishHttpRequest(int64_t requestId, bool ok,
   }
   payload["kind"] = "http.response";
   payload["ok"] = payload.value("ok", ok);
-  emit(wait.plugin, std::move(payload));
+  emit(wait.owner, std::move(payload));
 }
 
-void PluginNetHub::Impl::cancelHttpRequest(const std::string &plugin,
+void NetHub::Impl::cancelHttpRequest(const std::string &owner,
                                            int64_t requestId, Json &out) {
   const auto it = httpWaits.find(requestId);
-  if (it == httpWaits.end() || it->second.plugin != plugin) {
+  if (it == httpWaits.end() || it->second.owner != owner) {
     out = errorJson("not_found", "没有这个进行中的请求");
     return;
   }
@@ -2751,13 +2751,13 @@ void TcpStream::onConnected() {
   event["id"] = id;
   event["remote"] = remote;
   event["local"] = local;
-  hub->emit(plugin, std::move(event));
+  hub->emit(owner, std::move(event));
   start();
 }
 
 /* ==================== TCP 服务端连接 ==================== */
 
-asio::awaitable<void> PluginNetHub::Impl::onTcpAccepted(
+asio::awaitable<void> NetHub::Impl::onTcpAccepted(
     const std::shared_ptr<Server> &server,
     std::shared_ptr<utilxx::TcpConnection> conn) {
   auto self = shared_from_this();
@@ -2765,14 +2765,14 @@ asio::awaitable<void> PluginNetHub::Impl::onTcpAccepted(
     co_return;
   }
   if (server->conns.size() >= static_cast<size_t>(server->maxConnections) ||
-      connectionCountOf(server->plugin) >= kMaxConnectionsPerPlugin) {
+      connectionCountOf(server->owner) >= kMaxConnectionsPerOwner) {
     conn->abort();
     co_return;
   }
   const int64_t seq = nextConnSeq.fetch_add(1, std::memory_order_relaxed);
   auto tcp = std::make_shared<TcpStream>(self);
   tcp->tcpConn = std::move(conn);
-  tcp->plugin = server->plugin;
+  tcp->owner = server->owner;
   tcp->serverId = server->id;
   tcp->id = server->id + "#" + std::to_string(seq);
   tcp->server = server;
@@ -2788,7 +2788,7 @@ asio::awaitable<void> PluginNetHub::Impl::onTcpAccepted(
   event["id"] = tcp->id;
   event["remote"] = tcp->remote;
   event["local"] = tcp->local;
-  emit(server->plugin, std::move(event));
+  emit(server->owner, std::move(event));
   tcp->start();
   // 这条协程就是连接的生命周期: 连接关掉（或服务停止）才返回
   co_await tcp->waitClosed();
@@ -2799,12 +2799,12 @@ asio::awaitable<void> PluginNetHub::Impl::onTcpAccepted(
 /// 一条 WebSocket 连接（客户端连上的，或服务端接受来的）
 ///
 /// 握手、掩码、分片、ping/pong 与关闭握手都交给库的 `WsClient`（`wsConnect` /
-/// `wrapAcceptedWs`）；这里只负责插件面的事件与关闭语义。
+/// `wrapAcceptedWs`）；这里只负责属主面的事件与关闭语义。
 struct WsStream : Stream {
-  explicit WsStream(std::shared_ptr<PluginNetHub::Impl> hubRef)
+  explicit WsStream(std::shared_ptr<NetHub::Impl> hubRef)
       : Stream(std::move(hubRef), std::shared_ptr<utilxx::WsClient>{}) {}
 
-  std::shared_ptr<PluginNetHub::Impl::Server> server; ///< 服务端连接才有
+  std::shared_ptr<NetHub::Impl::Server> server; ///< 服务端连接才有
   bool roleClient = true;
 
   // 客户端参数（由 ws.connect 填）
@@ -2816,7 +2816,7 @@ struct WsStream : Stream {
 
   // 双方共用
   int64_t maxMessage = kMaxWsMessage;
-  std::string closeBy; ///< remote / local / error / plugin_unloaded
+  std::string closeBy; ///< remote / local / error / owner_unloaded
   int32_t closeCode = 0;
   std::string closeReason;
 
@@ -2829,8 +2829,8 @@ struct WsStream : Stream {
   void startAccepted(const Json &handshakeHeaders, std::string_view path,
                      std::string_view subprotocol);
 
-  /// 插件要求关闭（发关闭帧再收尾）
-  void closeByPlugin(int32_t code, std::string reason);
+  /// 属主要求关闭（发关闭帧再收尾）
+  void closeByOwner(int32_t code, std::string reason);
 
   /// WebSocket 不经过字节流（消息由 [onWsMessage] 给出）
   void onBytes(const char *, size_t) override {}
@@ -2848,7 +2848,7 @@ struct WsStream : Stream {
       event["text"] = toSafeText(payload);
     }
     event["bytes"] = static_cast<int64_t>(payload.size());
-    hub->emit(plugin, std::move(event));
+    hub->emit(owner, std::move(event));
   }
 
   void onClosed(std::string_view reason, std::string_view error) override {
@@ -2864,8 +2864,8 @@ struct WsStream : Stream {
         closeBy = "local";
       } else if (reason == "remote_closed") {
         closeBy = "remote";
-      } else if (reason == "plugin_unloaded") {
-        closeBy = "plugin";
+      } else if (reason == "owner_unloaded") {
+        closeBy = "owner";
       } else {
         closeBy = "error";
       }
@@ -2880,12 +2880,12 @@ struct WsStream : Stream {
     if (!error.empty()) {
       event["error"] = std::string{error};
     }
-    hub->emit(plugin, std::move(event));
+    hub->emit(owner, std::move(event));
   }
 
   /// 发 `ws.open` 并开始读（客户端与服务端共用）
   void emitOpen(Json event) {
-    hub->emit(plugin, std::move(event));
+    hub->emit(owner, std::move(event));
     start();
   }
 };
@@ -2987,7 +2987,7 @@ void WsStream::startAccepted(const Json &handshakeHeaders,
   emitOpen(std::move(event));
 }
 
-void WsStream::closeByPlugin(int32_t code, std::string reason) {
+void WsStream::closeByOwner(int32_t code, std::string reason) {
   const int32_t wanted = code <= 0 ? 1000 : code;
   if (!wsClient) {
     closeBy = "local";
@@ -2999,8 +2999,8 @@ void WsStream::closeByPlugin(int32_t code, std::string reason) {
   asio::co_spawn(
       executor,
       [self, wanted, reason = std::move(reason)]() -> asio::awaitable<void> {
-        co_await self->wsClient->sendClose(static_cast<uint16_t>(wanted),
-                                           reason);
+        /// 关闭帧是"告知对方"的动作: 返回值 (失败原因) 不影响后续收尾
+        (void)co_await self->wsClient->sendClose(static_cast<uint16_t>(wanted), reason);
         if (self->closing) {
           co_return;
         }
@@ -3015,7 +3015,7 @@ void WsStream::closeByPlugin(int32_t code, std::string reason) {
 
 /* ==================== WebSocket 服务（交给库的 HttpServer） ==================== */
 
-bool PluginNetHub::Impl::listenWsServer(const std::shared_ptr<Server> &server,
+bool NetHub::Impl::listenWsServer(const std::shared_ptr<Server> &server,
                                         std::string &err) {
   utilxx::HttpServer::Config config;
   config.address = server->host;
@@ -3026,7 +3026,7 @@ bool PluginNetHub::Impl::listenWsServer(const std::shared_ptr<Server> &server,
   config.accessLogEnabled = false;
   auto http = std::make_shared<utilxx::HttpServer>(config);
   auto self = shared_from_this();
-  // 插件的 `path` 是前缀（空 = 任意路径），所以用“任意路径升级”再自己判前缀
+  // 属主的 `path` 是前缀（空 = 任意路径），所以用“任意路径升级”再自己判前缀
   http->enableWebSocketAny(
       [self, server](utilxx::HttpServer::WsStream &ws,
                      const utilxx::HttpServer::Request &request)
@@ -3043,11 +3043,11 @@ bool PluginNetHub::Impl::listenWsServer(const std::shared_ptr<Server> &server,
   server->port = http->port();
   server->url = "ws://" + server->host + ":" + std::to_string(server->port) +
                 server->pathPrefix;
-  servers[serverKeyOf(server->plugin, server->kind, server->id)] = server;
+  servers[serverKeyOf(server->owner, server->kind, server->id)] = server;
   return true;
 }
 
-asio::awaitable<void> PluginNetHub::Impl::onWsAccepted(
+asio::awaitable<void> NetHub::Impl::onWsAccepted(
     const std::shared_ptr<Server> &server, utilxx::HttpServer::WsStream &ws,
     const utilxx::HttpServer::Request &request) {
   auto self = shared_from_this();
@@ -3057,7 +3057,7 @@ asio::awaitable<void> PluginNetHub::Impl::onWsAccepted(
     co_return;
   }
   if (server->conns.size() >= static_cast<size_t>(server->maxConnections) ||
-      connectionCountOf(server->plugin) >= kMaxConnectionsPerPlugin) {
+      connectionCountOf(server->owner) >= kMaxConnectionsPerOwner) {
     co_return;
   }
   utilxx::WsClientConfig config;
@@ -3069,7 +3069,7 @@ asio::awaitable<void> PluginNetHub::Impl::onWsAccepted(
   const int64_t seq = nextConnSeq.fetch_add(1, std::memory_order_relaxed);
   auto stream = std::make_shared<WsStream>(self);
   stream->wsClient = std::shared_ptr<utilxx::WsClient>(std::move(client));
-  stream->plugin = server->plugin;
+  stream->owner = server->owner;
   stream->serverId = server->id;
   stream->id = server->id + "#" + std::to_string(seq);
   stream->server = server;
@@ -3108,11 +3108,11 @@ asio::awaitable<void> PluginNetHub::Impl::onWsAccepted(
 /// - 建通道时就打开 `SO_BROADCAST`, 所以 `udp.send` 可以直接发给 `255.255.255.255`
 ///   或子网广播地址（例如 `192.168.1.255`）;
 /// - 组播地址在 `udp.open` 的 `multicast` 里声明, 也可以用 `udp.join` / `udp.leave` 动态增删;
-/// - 收到的包以 `udp.message` 事件交给插件（`dataBase64` 恒有, 合法文本包额外带 `text` / `data`）;
-/// - 通道跟着插件实例: 停用 / 卸载 / 关『拟声++』/ 插件框架停机时一起关掉。
+/// - 收到的包以 `udp.message` 事件交给属主（`dataBase64` 恒有, 合法文本包额外带 `text` / `data`）;
+/// - 通道跟着属主: 属主停用 / 卸载 / 调用方停机时一起关掉。
 struct UdpChannel : std::enable_shared_from_this<UdpChannel> {
-  std::shared_ptr<PluginNetHub::Impl> hub;
-  std::string plugin;
+  std::shared_ptr<NetHub::Impl> hub;
+  std::string owner;
   std::string id;
   std::string host; ///< 绑定地址
   uint16_t port = 0; ///< 绑定端口（0 = 系统分配, 绑定后回填实际端口）
@@ -3145,11 +3145,11 @@ void UdpChannel::startRead() {
         try {
           std::rethrow_exception(ep);
         } catch (const std::exception &e) {
-          XX_LOGW("[utilxx] 插件 `{}` 的 UDP 通道 `{}` 收包循环退出: {}",
-                  self->plugin, self->id, e.what());
+          XX_LOGW("[utilxx] 属主 `{}` 的 UDP 通道 `{}` 收包循环退出: {}",
+                  self->owner, self->id, e.what());
         } catch (...) {
-          XX_LOGW("[utilxx] 插件 `{}` 的 UDP 通道 `{}` 收包循环异常退出",
-                  self->plugin, self->id);
+          XX_LOGW("[utilxx] 属主 `{}` 的 UDP 通道 `{}` 收包循环异常退出",
+                  self->owner, self->id);
         }
       });
 }
@@ -3168,7 +3168,7 @@ asio::awaitable<void> UdpChannel::readLoop() {
         co_return;
       }
       if (++failures >= 8) {
-        XX_LOGW("[utilxx] 插件 `{}` 的 UDP 通道 `{}` 连续收包失败: {}", plugin,
+        XX_LOGW("[utilxx] 属主 `{}` 的 UDP 通道 `{}` 连续收包失败: {}", owner,
                 id, got.error());
         co_return;
       }
@@ -3193,7 +3193,7 @@ asio::awaitable<void> UdpChannel::readLoop() {
       event["text"] = std::string{view};
       event["data"] = std::string{view};
     }
-    hub->emit(plugin, std::move(event));
+    hub->emit(owner, std::move(event));
   }
 }
 
@@ -3214,7 +3214,7 @@ void closeUnannouncedUdp(const std::shared_ptr<UdpChannel> &channel) {
 
 } // namespace
 
-void PluginNetHub::Impl::shutdownUdp(
+void NetHub::Impl::shutdownUdp(
     const std::shared_ptr<UdpChannel> &channel, const char *reason) {
   if (!channel || channel->closing) {
     return;
@@ -3227,13 +3227,13 @@ void PluginNetHub::Impl::shutdownUdp(
   event["kind"] = "udp.closed";
   event["id"] = channel->id;
   event["reason"] = std::string{reason ? reason : "local_close"};
-  emit(channel->plugin, std::move(event));
+  emit(channel->owner, std::move(event));
 }
 
-void PluginNetHub::Impl::closeUdpOf(const std::string &plugin,
-                                    bool allPlugins) {  std::vector<std::shared_ptr<UdpChannel>> closing;
+void NetHub::Impl::closeUdpOf(const std::string &owner,
+                                    bool allOwners) {  std::vector<std::shared_ptr<UdpChannel>> closing;
   for (auto it = udpChannels.begin(); it != udpChannels.end();) {
-    if (!it->second || (allPlugins ? true : it->second->plugin == plugin)) {
+    if (!it->second || (allOwners ? true : it->second->owner == owner)) {
       closing.push_back(it->second);
       it = udpChannels.erase(it);
     } else {
@@ -3241,11 +3241,11 @@ void PluginNetHub::Impl::closeUdpOf(const std::string &plugin,
     }
   }
   for (const auto &channel : closing) {
-    shutdownUdp(channel, "plugin_unloaded");
+    shutdownUdp(channel, "owner_unloaded");
   }
 }
 
-bool PluginNetHub::Impl::openUdp(const std::string &plugin, const Json &args,
+bool NetHub::Impl::openUdp(const std::string &owner, const Json &args,
                                   Json &out) {
   const std::string wantedId{trimAscii(args.value("id", std::string{}))};
   if (!wantedId.empty() && !isValidId(wantedId)) {
@@ -3255,13 +3255,13 @@ bool PluginNetHub::Impl::openUdp(const std::string &plugin, const Json &args,
   }
   size_t count = 0;
   for (const auto &item : udpChannels) {
-    if (item.second && item.second->plugin == plugin) {
+    if (item.second && item.second->owner == owner) {
       ++count;
     }
   }
-  if (count >= kMaxUdpChannelsPerPlugin) {
+  if (count >= kMaxUdpChannelsPerOwner) {
     out = errorJson("too_many", "UDP 通道已达上限 (" +
-                                      std::to_string(kMaxUdpChannelsPerPlugin) +
+                                      std::to_string(kMaxUdpChannelsPerOwner) +
                                       " 条)");
     return false;
   }
@@ -3269,8 +3269,8 @@ bool PluginNetHub::Impl::openUdp(const std::string &plugin, const Json &args,
   if (id.empty()) {
     do {
       id = "udp" + std::to_string(nextConnSeq.fetch_add(1));
-    } while (udpChannels.find(connKeyOf(plugin, id)) != udpChannels.end());
-  } else if (udpChannels.find(connKeyOf(plugin, id)) != udpChannels.end()) {
+    } while (udpChannels.find(connKeyOf(owner, id)) != udpChannels.end());
+  } else if (udpChannels.find(connKeyOf(owner, id)) != udpChannels.end()) {
     out = errorJson("exists", "已有同 id 的 UDP 通道: " + id);
     return false;
   }
@@ -3296,15 +3296,15 @@ bool PluginNetHub::Impl::openUdp(const std::string &plugin, const Json &args,
 
   auto channel = std::make_shared<UdpChannel>();
   channel->hub = shared_from_this();
-  channel->plugin = plugin;
+  channel->owner = owner;
   channel->id = id;
   channel->host = address.to_string();
   channel->port = static_cast<uint16_t>(rawPort);
   utilxx::UdpConfig socketConfig;
   socketConfig.address = channel->host;
   socketConfig.port = channel->port;
-  // 广播: 建通道时就开, 这样插件不必先"声明要广播"才能发给 255.255.255.255; 地址重用
-  // （组播 / 多实例监听同一端口要用）缺省开, 插件可以写 reuseAddress: false 关掉
+  // 广播: 建通道时就开, 这样属主不必先"声明要广播"才能发给 255.255.255.255; 地址重用
+  // （组播 / 多实例监听同一端口要用）缺省开, 属主可以写 reuseAddress: false 关掉
   socketConfig.broadcast = true;
   socketConfig.reuseAddress = args.value("reuseAddress", true);
   auto opened = utilxx::UdpSocket::openSync(io.get_executor(), socketConfig);
@@ -3348,7 +3348,7 @@ bool PluginNetHub::Impl::openUdp(const std::string &plugin, const Json &args,
     channel->groups.insert(groupAddress.to_string());
   }
 
-  udpChannels[connKeyOf(plugin, id)] = channel;
+  udpChannels[connKeyOf(owner, id)] = channel;
   channel->startRead();
 
   Json event;
@@ -3356,7 +3356,7 @@ bool PluginNetHub::Impl::openUdp(const std::string &plugin, const Json &args,
   event["id"] = id;
   event["host"] = channel->host;
   event["port"] = static_cast<int64_t>(channel->port);
-  emit(plugin, event);
+  emit(owner, event);
 
   out = Json::object();
   out["ok"] = true;
@@ -3373,10 +3373,10 @@ bool PluginNetHub::Impl::openUdp(const std::string &plugin, const Json &args,
   return true;
 }
 
-bool PluginNetHub::Impl::groupUdp(const std::string &plugin, const Json &args,
+bool NetHub::Impl::groupUdp(const std::string &owner, const Json &args,
                                    bool join, Json &out) {
   const std::string id{trimAscii(args.value("id", std::string{}))};
-  const auto it = udpChannels.find(connKeyOf(plugin, id));
+  const auto it = udpChannels.find(connKeyOf(owner, id));
   if (it == udpChannels.end() || !it->second) {
     out = errorJson("not_found", "没有这个 UDP 通道: " + id);
     return false;
@@ -3420,10 +3420,10 @@ bool PluginNetHub::Impl::groupUdp(const std::string &plugin, const Json &args,
   return true;
 }
 
-void PluginNetHub::Impl::sendUdp(const std::string &plugin, const Json &args,
+void NetHub::Impl::sendUdp(const std::string &owner, const Json &args,
                                  Json &out) {
   const std::string id{trimAscii(args.value("id", std::string{}))};
-  const auto it = udpChannels.find(connKeyOf(plugin, id));
+  const auto it = udpChannels.find(connKeyOf(owner, id));
   if (it == udpChannels.end() || !it->second) {
     out = errorJson("not_found", "没有这个 UDP 通道: " + id);
     return;
@@ -3494,9 +3494,9 @@ void PluginNetHub::Impl::sendUdp(const std::string &plugin, const Json &args,
   out["bytes"] = static_cast<int64_t>(payload.size());
 }
 
-void PluginNetHub::Impl::closeUdp(const std::string &plugin,
+void NetHub::Impl::closeUdp(const std::string &owner,
                                   const std::string &id, Json &out) {
-  const auto it = udpChannels.find(connKeyOf(plugin, id));
+  const auto it = udpChannels.find(connKeyOf(owner, id));
   if (it == udpChannels.end() || !it->second) {
     out = errorJson("not_found", "没有这个 UDP 通道: " + id);
     return;
@@ -3509,16 +3509,16 @@ void PluginNetHub::Impl::closeUdp(const std::string &plugin,
   out["id"] = id;
 }
 
-Json PluginNetHub::Impl::udpInfoJson(const std::string &plugin,
-                                     bool allPlugins) const {
+Json NetHub::Impl::udpInfoJson(const std::string &owner,
+                                     bool allOwners) const {
   Json rows = Json::array();
   for (const auto &item : udpChannels) {
     const auto &channel = item.second;
-    if (!channel || (!allPlugins && channel->plugin != plugin)) {
+    if (!channel || (!allOwners && channel->owner != owner)) {
       continue;
     }
     Json row = Json::object();
-    row["plugin"] = channel->plugin;
+    row["owner"] = channel->owner;
     row["id"] = channel->id;
     row["host"] = channel->host;
     row["port"] = static_cast<int64_t>(channel->port);
@@ -3538,12 +3538,12 @@ Json PluginNetHub::Impl::udpInfoJson(const std::string &plugin,
 
 /* ==================== 操作分发 ==================== */
 
-void PluginNetHub::Impl::stopServers(const std::string &plugin,
+void NetHub::Impl::stopServers(const std::string &owner,
                                      const std::string &kind,
                                      const std::string &id, Json &out) {
   std::vector<std::shared_ptr<Server>> closing;
   for (auto it = servers.begin(); it != servers.end();) {
-    if (it->second && it->second->plugin == plugin &&
+    if (it->second && it->second->owner == owner &&
         (id.empty() || it->second->id == id)) {
       closing.push_back(it->second);
       it = servers.erase(it);
@@ -3557,14 +3557,14 @@ void PluginNetHub::Impl::stopServers(const std::string &plugin,
     if (server->http) {
       server->http->stop();
       wakePendingOfServer(
-          serverKeyOf(server->plugin, server->kind, server->id));
+          serverKeyOf(server->owner, server->kind, server->id));
     }
     if (server->tcp) {
       server->tcp->stop();
     }
     std::vector<std::string> connIds(server->conns.begin(), server->conns.end());
     for (const auto &connId : connIds) {
-      const auto stream = findConn(plugin, connId);
+      const auto stream = findConn(owner, connId);
       if (stream) {
         stream->closeStream("server_stopped", {});
       }
@@ -3574,22 +3574,22 @@ void PluginNetHub::Impl::stopServers(const std::string &plugin,
                       : kind == "ws" ? "ws.serverClosed"
                                      : "socket.serverClosed";
     event["id"] = server->id;
-    emit(plugin, std::move(event));
+    emit(owner, std::move(event));
   }
   out = Json::object();
   out["ok"] = true;
   out["stopped"] = stopped;
 }
 
-void PluginNetHub::Impl::closeConn(const std::string &plugin,
+void NetHub::Impl::closeConn(const std::string &owner,
                                    const std::string &id, Json &out) {
-  const auto stream = findConn(plugin, id);
+  const auto stream = findConn(owner, id);
   if (!stream) {
     out = errorJson("not_found", "没有这条连接");
     return;
   }
   if (auto ws = std::dynamic_pointer_cast<WsStream>(stream)) {
-    ws->closeByPlugin(1000, {});
+    ws->closeByOwner(1000, {});
   } else {
     stream->requestClose();
   }
@@ -3598,14 +3598,14 @@ void PluginNetHub::Impl::closeConn(const std::string &plugin,
   out["id"] = id;
 }
 
-void PluginNetHub::Impl::sendConn(const std::string &plugin, const Json &args,
+void NetHub::Impl::sendConn(const std::string &owner, const Json &args,
                                   Json &out) {
   const std::string id = args.value("id", std::string{});
   if (id.empty()) {
     out = errorJson("bad_args", "缺少连接 id");
     return;
   }
-  const auto stream = findConn(plugin, id);
+  const auto stream = findConn(owner, id);
   if (!stream) {
     out = errorJson("not_found", "没有这条连接");
     return;
@@ -3648,11 +3648,11 @@ void PluginNetHub::Impl::sendConn(const std::string &plugin, const Json &args,
   out = Json::object();
   out["ok"] = true;
   out["id"] = id;
-  // 发送队列里还没写出去的字节数: 插件用它判断要不要先暂停上游 (背压)
+  // 发送队列里还没写出去的字节数: 属主用它判断要不要先暂停上游 (背压)
   out["queuedBytes"] = static_cast<int64_t>(stream->outBytes);
 }
 
-std::string PluginNetHub::Impl::staticBaseUrl(const Server &server) const {
+std::string NetHub::Impl::staticBaseUrl(const Server &server) const {
   if (server.url.empty()) {
     return server.url;
   }
@@ -3665,7 +3665,7 @@ std::string PluginNetHub::Impl::staticBaseUrl(const Server &server) const {
   return server.url;
 }
 
-Json PluginNetHub::Impl::staticRoutesJson(const Server &server) const {
+Json NetHub::Impl::staticRoutesJson(const Server &server) const {
   Json rows = Json::array();
   for (const auto &route : server.routes) {
     if (!route) {
@@ -3686,8 +3686,8 @@ Json PluginNetHub::Impl::staticRoutesJson(const Server &server) const {
   return rows;
 }
 
-std::string PluginNetHub::Impl::infoJsonOnThread(const std::string &plugin,
-                                                 bool allPlugins) {
+std::string NetHub::Impl::infoJsonOnThread(const std::string &owner,
+                                                 bool allOwners) {
   Json out = Json::object();
   out["ok"] = true;
   out["running"] = running.load(std::memory_order_acquire);
@@ -3705,11 +3705,11 @@ std::string PluginNetHub::Impl::infoJsonOnThread(const std::string &plugin,
   Json serversJson = Json::array();
   for (const auto &item : servers) {
     const auto &server = item.second;
-    if (!server || (!allPlugins && server->plugin != plugin)) {
+    if (!server || (!allOwners && server->owner != owner)) {
       continue;
     }
     Json row = Json::object();
-    row["plugin"] = server->plugin;
+    row["owner"] = server->owner;
     row["kind"] = server->kind;
     row["id"] = server->id;
     row["host"] = server->host;
@@ -3736,11 +3736,11 @@ std::string PluginNetHub::Impl::infoJsonOnThread(const std::string &plugin,
   Json connsJson = Json::array();
   for (const auto &item : conns) {
     const auto &stream = item.second;
-    if (!stream || (!allPlugins && stream->plugin != plugin)) {
+    if (!stream || (!allOwners && stream->owner != owner)) {
       continue;
     }
     Json row = Json::object();
-    row["plugin"] = stream->plugin;
+    row["owner"] = stream->owner;
     row["id"] = stream->id;
     row["kind"] = stream->kind();
     if (!stream->serverId.empty()) {
@@ -3755,41 +3755,41 @@ std::string PluginNetHub::Impl::infoJsonOnThread(const std::string &plugin,
   out["connections"] = std::move(connsJson);
   size_t httpClients = 0;
   for (const auto &item : httpWaits) {
-    if (allPlugins || item.second.plugin == plugin) {
+    if (allOwners || item.second.owner == owner) {
       ++httpClients;
     }
   }
   out["httpClients"] = static_cast<int64_t>(httpClients);
-  out["udp"] = udpInfoJson(plugin, allPlugins);
+  out["udp"] = udpInfoJson(owner, allOwners);
   Json limits = Json::object();
   limits["maxServersPerKind"] = kMaxServersPerKind;
-  limits["maxConnectionsPerPlugin"] =
-      static_cast<int64_t>(kMaxConnectionsPerPlugin);
-  limits["maxHttpClientsPerPlugin"] =
-      static_cast<int64_t>(kMaxHttpClientsPerPlugin);
+  limits["maxConnectionsPerOwner"] =
+      static_cast<int64_t>(kMaxConnectionsPerOwner);
+  limits["maxHttpClientsPerOwner"] =
+      static_cast<int64_t>(kMaxHttpClientsPerOwner);
   limits["maxHttpPendingPerServer"] =
       static_cast<int64_t>(kMaxHttpPendingPerServer);
   limits["maxHttpBodyBytes"] = kMaxHttpBody;
   limits["maxWsMessageBytes"] = kMaxWsMessage;
   limits["maxOutQueueBytes"] = static_cast<int64_t>(kMaxOutQueue);
-  limits["maxUdpChannelsPerPlugin"] =
-      static_cast<int64_t>(kMaxUdpChannelsPerPlugin);
+  limits["maxUdpChannelsPerOwner"] =
+      static_cast<int64_t>(kMaxUdpChannelsPerOwner);
   out["limits"] = std::move(limits);
   return out.dump();
 }
 
-int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
+int32_t NetHub::Impl::handleCall(const std::string &owner,
                                        const std::string &op, const Json &args,
                                        Json &out) {
   if (!args.is_object()) {
     out = errorJson("bad_args", "参数必须是对象");
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
 
   /* ---------- 通用 ---------- */
   if (op == "net.info") {
-    out = parseJsonSafe(infoJsonOnThread(plugin, false));
-    return PLUGINXX_NET_OK;
+    out = parseJsonSafe(infoJsonOnThread(owner, false));
+    return net::Ok;
   }
 
   /* ---------- HTTP 客户端 (同步形态: 只受理, 结果经事件) ---------- */
@@ -3797,14 +3797,14 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     const int32_t mode =
         (op == "http.fetch") ? 1 : ((op == "http.download") ? 2 : 0);
     const int64_t requestId = allocateRequestId();
-    if (!startHttpRequest(plugin, requestId, args, DoneFn{}, out, mode)) {
-      return PLUGINXX_NET_OK; ///< out 里已经是错误对象
+    if (!startHttpRequest(owner, requestId, args, DoneFn{}, out, mode)) {
+      return net::Ok; ///< out 里已经是错误对象
     }
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
   if (op == "http.cancel") {
-    cancelHttpRequest(plugin, args.value("requestId", int64_t{0}), out);
-    return PLUGINXX_NET_OK;
+    cancelHttpRequest(owner, args.value("requestId", int64_t{0}), out);
+    return net::Ok;
   }
 
   /* ---------- HTTP 服务端 ---------- */
@@ -3812,24 +3812,24 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     std::string id = args.value("id", std::string{});
     if (!id.empty() && !isValidId(id)) {
       out = errorJson("bad_id", "id 只能包含字母数字与 . _ -");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     if (id.empty()) {
-      id = nextServerId(plugin, "http");
+      id = nextServerId(owner, "http");
     }
-    if (findServer(plugin, "http", id)) {
+    if (findServer(owner, "http", id)) {
       out = errorJson("exists", "同名的 HTTP 服务已经存在");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     auto server = std::make_shared<Server>();
-    server->plugin = plugin;
+    server->owner = owner;
     server->kind = "http";
     server->id = id;
     server->host = args.value("host", std::string{"127.0.0.1"});
     const int64_t port = args.value("port", int64_t{0});
     if (port < 0 || port > 65535) {
       out = errorJson("bad_port", "端口超出范围");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     server->port = static_cast<uint16_t>(port);
     server->pathPrefix = args.value("path", std::string{});
@@ -3847,20 +3847,20 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     if (args.contains("static")) {
       if (!args["static"].is_array()) {
         out = errorJson("bad_args", "static 必须是数组");
-        return PLUGINXX_NET_OK;
+        return net::Ok;
       }
       for (const auto &item : args["static"]) {
         if (routes.size() >= kMaxStaticRoutes) {
           out = errorJson("too_many", "static 条数超过上限 (" +
                                          std::to_string(kMaxStaticRoutes) +
                                          " 条)");
-          return PLUGINXX_NET_OK;
+          return net::Ok;
         }
         auto route = std::make_shared<Server::StaticRoute>();
         std::string routeErr;
         if (!buildStaticRoute(*server, item, route, routeErr)) {
           out = errorJson("bad_args", "static 里有一条不合法: " + routeErr);
-          return PLUGINXX_NET_OK;
+          return net::Ok;
         }
         routes.push_back(std::move(route));
       }
@@ -3869,7 +3869,7 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     std::string err;
     if (!listenServer(server, err)) {
       out = errorJson("listen_failed", err);
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     out = Json::object();
     out["ok"] = true;
@@ -3886,26 +3886,26 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     event["host"] = server->host;
     event["port"] = static_cast<int64_t>(server->port);
     event["url"] = server->url;
-    emit(plugin, std::move(event));
-    return PLUGINXX_NET_OK;
+    emit(owner, std::move(event));
+    return net::Ok;
   }
   if (op == "http.route" || op == "http.unroute") {
     const std::string serverId =
         args.value("serverId", args.value("id", std::string{}));
     if (serverId.empty()) {
       out = errorJson("bad_args", "要给 serverId");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
-    auto server = findServer(plugin, "http", serverId);
+    auto server = findServer(owner, "http", serverId);
     if (!server) {
       out = errorJson("not_found", "HTTP 服务不存在: " + serverId);
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     if (op == "http.unroute") {
       const std::string path{trimAscii(args.value("path", std::string{}))};
       if (path.empty()) {
         out = errorJson("bad_args", "要给 path");
-        return PLUGINXX_NET_OK;
+        return net::Ok;
       }
       out = Json::object();
       out["ok"] = true;
@@ -3913,18 +3913,18 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
       out["path"] = path;
       out["removed"] = removeStaticRoute(server, path);
       out["routes"] = staticRoutesJson(*server);
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     addStaticRoute(server, args, out);
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
   if (op == "http.respond") {
     const int64_t requestId = args.value("requestId", int64_t{0});
-    std::string owner;
-    const auto wait = takePendingHttp(requestId, &owner);
-    if (!wait || owner != plugin) {
+    std::string   pendingOwner;
+    const auto    wait = takePendingHttp(requestId, &pendingOwner);
+    if (!wait || pendingOwner != owner) {
       out = errorJson("not_found", "没有这条等待回答的请求");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     wait->payload = args;
     wait->answered = true;
@@ -3934,15 +3934,15 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     out = Json::object();
     out["ok"] = true;
     out["requestId"] = requestId;
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
   if (op == "http.stop") {
-    stopServers(plugin, "http", args.value("id", std::string{}), out);
-    return PLUGINXX_NET_OK;
+    stopServers(owner, "http", args.value("id", std::string{}), out);
+    return net::Ok;
   }
   if (op == "http.info") {
-    out = parseJsonSafe(infoJsonOnThread(plugin, false));
-    return PLUGINXX_NET_OK;
+    out = parseJsonSafe(infoJsonOnThread(owner, false));
+    return net::Ok;
   }
 
   /* ---------- TCP 客户端 ---------- */
@@ -3951,26 +3951,26 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     const int64_t port = args.value("port", int64_t{0});
     if (host.empty() || port <= 0 || port > 65535) {
       out = errorJson("bad_args", "host / port 不合法");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     std::string id = args.value("id", std::string{});
     if (!id.empty() && !isValidId(id)) {
       out = errorJson("bad_id", "id 只能包含字母数字与 . _ -");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     if (id.empty()) {
-      id = nextConnId(plugin, "c");
+      id = nextConnId(owner, "c");
     }
-    if (findConn(plugin, id)) {
+    if (findConn(owner, id)) {
       out = errorJson("exists", "同名的连接已经存在");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     auto stream = std::make_shared<TcpStream>(shared_from_this());
-    stream->plugin = plugin;
+    stream->owner = owner;
     stream->id = id;
     if (!registerStream(stream)) {
       out = errorJson("too_many", "连接数已达上限");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     out = Json::object();
     out["ok"] = true;
@@ -3979,7 +3979,7 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     const int32_t timeoutMs =
         static_cast<int32_t>(args.value("timeoutMs", int64_t{8000}));
     stream->connectTo(host, static_cast<uint16_t>(port), timeoutMs);
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
 
   /* ---------- TCP 服务 ---------- */
@@ -3987,24 +3987,24 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     std::string id = args.value("id", std::string{});
     if (!id.empty() && !isValidId(id)) {
       out = errorJson("bad_id", "id 只能包含字母数字与 . _ -");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     if (id.empty()) {
-      id = nextServerId(plugin, "tcp");
+      id = nextServerId(owner, "tcp");
     }
-    if (findServer(plugin, "tcp", id)) {
+    if (findServer(owner, "tcp", id)) {
       out = errorJson("exists", "同名的服务已经存在");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     auto server = std::make_shared<Server>();
-    server->plugin = plugin;
+    server->owner = owner;
     server->kind = "tcp";
     server->id = id;
     server->host = args.value("host", std::string{"127.0.0.1"});
     const int64_t port = args.value("port", int64_t{0});
     if (port < 0 || port > 65535) {
       out = errorJson("bad_port", "端口超出范围");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     server->port = static_cast<uint16_t>(port);
     server->maxConnections = static_cast<int32_t>(
@@ -4015,7 +4015,7 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     std::string err;
     if (!listenServer(server, err)) {
       out = errorJson("listen_failed", err);
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     out = Json::object();
     out["ok"] = true;
@@ -4027,21 +4027,21 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     event["id"] = server->id;
     event["host"] = server->host;
     event["port"] = static_cast<int64_t>(server->port);
-    emit(plugin, std::move(event));
-    return PLUGINXX_NET_OK;
+    emit(owner, std::move(event));
+    return net::Ok;
   }
 
   /* ---------- 连接收发 (TCP 服务端连接同一套) ---------- */
   if (op == "socket.send") {
-    sendConn(plugin, args, out);
-    return PLUGINXX_NET_OK;
+    sendConn(owner, args, out);
+    return net::Ok;
   }
   if (op == "socket.pause") {
     const std::string id = args.value("id", std::string{});
-    const auto stream = findConn(plugin, id);
+    const auto stream = findConn(owner, id);
     if (!stream) {
       out = errorJson("not_found", "没有这条连接");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     const bool paused = args.value("paused", true);
     stream->setPaused(paused);
@@ -4049,19 +4049,19 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     out["ok"] = true;
     out["id"] = id;
     out["paused"] = paused;
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
   if (op == "socket.close") {
-    closeConn(plugin, args.value("id", std::string{}), out);
-    return PLUGINXX_NET_OK;
+    closeConn(owner, args.value("id", std::string{}), out);
+    return net::Ok;
   }
   if (op == "socket.serverStop") {
-    stopServers(plugin, "tcp", args.value("id", std::string{}), out);
-    return PLUGINXX_NET_OK;
+    stopServers(owner, "tcp", args.value("id", std::string{}), out);
+    return net::Ok;
   }
   if (op == "socket.info") {
-    out = parseJsonSafe(infoJsonOnThread(plugin, false));
-    return PLUGINXX_NET_OK;
+    out = parseJsonSafe(infoJsonOnThread(owner, false));
+    return net::Ok;
   }
 
   /* ---------- WebSocket 客户端 ---------- */
@@ -4081,31 +4081,31 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     }
     if (url.empty()) {
       out = errorJson("bad_args", "缺少 url");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     const ParsedUrl target = parseUrl(url);
     if (!target.ok) {
       out = errorJson("bad_url", target.error);
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     if (target.scheme != "ws" && target.scheme != "wss") {
       out = errorJson("unsupported_scheme", "WebSocket 地址只支持 ws:// 或 wss://");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     std::string id = args.value("id", std::string{});
     if (!id.empty() && !isValidId(id)) {
       out = errorJson("bad_id", "id 只能包含字母数字与 . _ -");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     if (id.empty()) {
-      id = nextConnId(plugin, "w");
+      id = nextConnId(owner, "w");
     }
-    if (findConn(plugin, id)) {
+    if (findConn(owner, id)) {
       out = errorJson("exists", "同名的连接已经存在");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     auto ws = std::make_shared<WsStream>(shared_from_this());
-    ws->plugin = plugin;
+    ws->owner = owner;
     ws->id = id;
     ws->roleClient = true;
     ws->url = url;
@@ -4128,14 +4128,14 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     }
     if (!registerStream(ws)) {
       out = errorJson("too_many", "连接数已达上限");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     out = Json::object();
     out["ok"] = true;
     out["id"] = id;
     out["state"] = "connecting";
     ws->startClient();
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
 
   /* ---------- WebSocket 服务 ---------- */
@@ -4143,24 +4143,24 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     std::string id = args.value("id", std::string{});
     if (!id.empty() && !isValidId(id)) {
       out = errorJson("bad_id", "id 只能包含字母数字与 . _ -");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     if (id.empty()) {
-      id = nextServerId(plugin, "ws");
+      id = nextServerId(owner, "ws");
     }
-    if (findServer(plugin, "ws", id)) {
+    if (findServer(owner, "ws", id)) {
       out = errorJson("exists", "同名的服务已经存在");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     auto server = std::make_shared<Server>();
-    server->plugin = plugin;
+    server->owner = owner;
     server->kind = "ws";
     server->id = id;
     server->host = args.value("host", std::string{"127.0.0.1"});
     const int64_t port = args.value("port", int64_t{0});
     if (port < 0 || port > 65535) {
       out = errorJson("bad_port", "端口超出范围");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     server->port = static_cast<uint16_t>(port);
     server->pathPrefix = args.value("path", std::string{});
@@ -4172,7 +4172,7 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     std::string err;
     if (!listenServer(server, err)) {
       out = errorJson("listen_failed", err);
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     out = Json::object();
     out["ok"] = true;
@@ -4186,20 +4186,20 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
     event["host"] = server->host;
     event["port"] = static_cast<int64_t>(server->port);
     event["url"] = server->url;
-    emit(plugin, std::move(event));
-    return PLUGINXX_NET_OK;
+    emit(owner, std::move(event));
+    return net::Ok;
   }
   if (op == "ws.send") {
     const std::string id = args.value("id", std::string{});
-    const auto stream = findConn(plugin, id);
+    const auto stream = findConn(owner, id);
     if (!stream) {
       out = errorJson("not_found", "没有这条连接");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     const auto ws = std::dynamic_pointer_cast<WsStream>(stream);
     if (!ws) {
       out = errorJson("wrong_kind", "这条连接不是 WebSocket 连接");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     int32_t opcode = 1;
     std::string payload;
@@ -4208,7 +4208,7 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
       const auto decoded = utilxx_base::base64Decode(base64);
       if (!decoded.has_value()) {
         out = errorJson("bad_base64", "dataBase64 解不开");
-        return PLUGINXX_NET_OK;
+        return net::Ok;
       }
       payload = *decoded;
       opcode = 2;
@@ -4219,89 +4219,89 @@ int32_t PluginNetHub::Impl::handleCall(const std::string &plugin,
       }
       if (payload.empty()) {
         out = errorJson("bad_args", "没有要发送的内容 (text / data / dataBase64)");
-        return PLUGINXX_NET_OK;
+        return net::Ok;
       }
     }
     std::string err;
     ws->sendWs(opcode, payload, err);
     if (!err.empty()) {
       out = errorJson(err, "发送失败 (连接可能还没握手完成)");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     out = Json::object();
     out["ok"] = true;
     out["id"] = id;
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
   if (op == "ws.ping") {
     const std::string id = args.value("id", std::string{});
-    const auto stream = findConn(plugin, id);
+    const auto stream = findConn(owner, id);
     const auto ws = std::dynamic_pointer_cast<WsStream>(stream);
     if (!ws) {
       out = errorJson("not_found", "没有这条连接");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     std::string err;
     ws->sendWs(9, args.value("text", std::string{}), err);
     out = err.empty() ? Json::object() : errorJson(err, "发送失败");
     out["ok"] = err.empty();
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
   if (op == "ws.close") {
     const std::string id = args.value("id", std::string{});
-    const auto stream = findConn(plugin, id);
+    const auto stream = findConn(owner, id);
     const auto ws = std::dynamic_pointer_cast<WsStream>(stream);
     if (!ws) {
       out = errorJson("not_found", "没有这条 WebSocket 连接");
-      return PLUGINXX_NET_OK;
+      return net::Ok;
     }
     const int32_t code =
         static_cast<int32_t>(args.value("code", int64_t{1000}));
-    ws->closeByPlugin(code <= 0 ? 1000 : code,
+    ws->closeByOwner(code <= 0 ? 1000 : code,
                       args.value("reason", std::string{}));
     out = Json::object();
     out["ok"] = true;
     out["id"] = id;
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
   if (op == "ws.serverStop") {
-    stopServers(plugin, "ws", args.value("id", std::string{}), out);
-    return PLUGINXX_NET_OK;
+    stopServers(owner, "ws", args.value("id", std::string{}), out);
+    return net::Ok;
   }
   if (op == "ws.info") {
-    out = parseJsonSafe(infoJsonOnThread(plugin, false));
-    return PLUGINXX_NET_OK;
+    out = parseJsonSafe(infoJsonOnThread(owner, false));
+    return net::Ok;
   }
 
   /* ---------- UDP 通道 (广播 / 组播 / 单播) ---------- */
   if (op == "udp.open") {
-    openUdp(plugin, args, out);
-    return PLUGINXX_NET_OK;
+    openUdp(owner, args, out);
+    return net::Ok;
   }
   if (op == "udp.send") {
-    sendUdp(plugin, args, out);
-    return PLUGINXX_NET_OK;
+    sendUdp(owner, args, out);
+    return net::Ok;
   }
   if (op == "udp.close") {
-    closeUdp(plugin,
+    closeUdp(owner,
              std::string{trimAscii(args.value("id", std::string{}))}, out);
-    return PLUGINXX_NET_OK;
+    return net::Ok;
   }
   if (op == "udp.join" || op == "udp.leave") {
-    groupUdp(plugin, args, op == "udp.join", out);
-    return PLUGINXX_NET_OK;
+    groupUdp(owner, args, op == "udp.join", out);
+    return net::Ok;
   }
   if (op == "udp.info") {
     out = Json::object();
     out["ok"] = true;
-    out["channels"] = udpInfoJson(plugin, false);
-    return PLUGINXX_NET_OK;
+    out["channels"] = udpInfoJson(owner, false);
+    return net::Ok;
   }
 
-  return PLUGINXX_NET_ERR_ARG;
+  return net::ErrArg;
 }
 
-void PluginNetHub::Impl::startThread() {
+void NetHub::Impl::startThread() {
   if (running.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
@@ -4313,13 +4313,13 @@ void PluginNetHub::Impl::startThread() {
     try {
       self->io.run();
     } catch (const std::exception &e) {
-      XX_LOGE("[utilxx] 插件网络线程退出: {}", e.what());
+      XX_LOGE("[utilxx] 属主网络线程退出: {}", e.what());
     }
   });
-  XX_LOGI("[utilxx] 插件网络线程已启动");
+  XX_LOGI("[utilxx] 属主网络线程已启动");
 }
 
-void PluginNetHub::Impl::stopThread() {
+void NetHub::Impl::stopThread() {
   if (!running.exchange(false, std::memory_order_acq_rel)) {
     if (thread.joinable()) {
       thread.join();
@@ -4338,73 +4338,73 @@ void PluginNetHub::Impl::stopThread() {
   if (thread.joinable()) {
     thread.join();
   }
-  XX_LOGI("[utilxx] 插件网络线程已停止");
+  XX_LOGI("[utilxx] 属主网络线程已停止");
 }
 
 /* ==================== 对外入口 ==================== */
 
-PluginNetHub::PluginNetHub(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
+NetHub::NetHub(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
-PluginNetHub::~PluginNetHub() { stop(); }
+NetHub::~NetHub() { stop(); }
 
-std::shared_ptr<PluginNetHub> PluginNetHub::create(PublishFn publish,
+std::shared_ptr<NetHub> NetHub::create(PublishFn publish,
                                                    PostFn postToFramework) {
   auto impl = std::make_shared<Impl>();
   impl->publish = std::move(publish);
   impl->postToFramework = std::move(postToFramework);
-  return std::shared_ptr<PluginNetHub>(new PluginNetHub(std::move(impl)));
+  return std::shared_ptr<NetHub>(new NetHub(std::move(impl)));
 }
 
-void PluginNetHub::start() { impl_->startThread(); }
+void NetHub::start() { impl_->startThread(); }
 
-void PluginNetHub::setDataDir(const std::string &dir) {
+void NetHub::setDataDir(const std::string &dir) {
   // 在 start() 之前设好 (主程序在 host 配置里给)
   impl_->dataDir = dir;
 }
 
-void PluginNetHub::stop() { impl_->stopThread(); }
+void NetHub::stop() { impl_->stopThread(); }
 
-bool PluginNetHub::running() const {
+bool NetHub::running() const {
   return impl_->running.load(std::memory_order_acquire);
 }
 
-int32_t PluginNetHub::call(const std::string &pluginId, const std::string &op,
+int32_t NetHub::call(const std::string &ownerId, const std::string &op,
                            const std::string &argsJson, std::string &outJson) {
   if (!running()) {
-    return PLUGINXX_NET_ERR_STATE;
+    return net::ErrState;
   }
   bool parsed = false;
   Json args = parseJsonSafe(argsJson, &parsed);
   if (!parsed) {
-    return PLUGINXX_NET_ERR_JSON;
+    return net::ErrJson;
   }
   auto result = std::make_shared<Json>(Json::object());
-  auto code = std::make_shared<int32_t>(PLUGINXX_NET_ERR_INTERNAL);
-  const bool waited = impl_->runSync([impl = impl_, pluginId, op, args, result,
+  auto code = std::make_shared<int32_t>(net::ErrInternal);
+  const bool waited = impl_->runSync([impl = impl_, ownerId, op, args, result,
                                       code] {
-    *code = impl->handleCall(pluginId, op, args, *result);
+    *code = impl->handleCall(ownerId, op, args, *result);
   });
   if (!waited) {
-    return PLUGINXX_NET_ERR_TIMEOUT;
+    return net::ErrTimeout;
   }
-  if (*code != PLUGINXX_NET_OK) {
+  if (*code != net::Ok) {
     return *code;
   }
   outJson = result->dump();
-  return PLUGINXX_NET_OK;
+  return net::Ok;
 }
 
-int32_t PluginNetHub::callAsync(const std::string &pluginId,
+int32_t NetHub::callAsync(const std::string &ownerId,
                                 const std::string &op,
                                 const std::string &argsJson, DoneFn done,
                                 std::string &outJson, int64_t *outRequestId) {
   if (!running()) {
-    outJson = errorJson("not_running", "插件网络线程没有运行").dump();
-    return PLUGINXX_NET_ERR_STATE;
+    outJson = errorJson("not_running", "属主网络线程没有运行").dump();
+    return net::ErrState;
   }
   if (op != "http.request" && op != "http.fetch" && op != "http.download") {
     outJson = errorJson("unsupported_op", "这个操作没有异步形态").dump();
-    return PLUGINXX_NET_ERR_ARG;
+    return net::ErrArg;
   }
   const int32_t mode =
       (op == "http.fetch") ? 1 : ((op == "http.download") ? 2 : 0);
@@ -4412,67 +4412,67 @@ int32_t PluginNetHub::callAsync(const std::string &pluginId,
   Json args = parseJsonSafe(argsJson, &parsed);
   if (!parsed) {
     outJson = errorJson("bad_json", "参数不是合法 JSON").dump();
-    return PLUGINXX_NET_ERR_JSON;
+    return net::ErrJson;
   }
   const int64_t requestId = impl_->allocateRequestId();
   auto result = std::make_shared<Json>(Json::object());
   auto started = std::make_shared<bool>(false);
   const bool waited = impl_->runSync(
-      [impl = impl_, pluginId, requestId, args, done = std::move(done), result,
+      [impl = impl_, ownerId, requestId, args, done = std::move(done), result,
        started, mode]() mutable {
-        *started = impl->startHttpRequest(pluginId, requestId, args,
+        *started = impl->startHttpRequest(ownerId, requestId, args,
                                           std::move(done), *result, mode);
       });
   if (!waited) {
     outJson = errorJson("timeout", "网络线程没有及时受理").dump();
-    return PLUGINXX_NET_ERR_TIMEOUT;
+    return net::ErrTimeout;
   }
   outJson = result->dump();
   if (!*started) {
-    return PLUGINXX_NET_ERR_ARG;
+    return net::ErrArg;
   }
   if (outRequestId) {
     *outRequestId = requestId;
   }
-  return PLUGINXX_NET_OK;
+  return net::Ok;
 }
 
-int32_t PluginNetHub::cancel(const std::string &pluginId, int64_t requestId,
+int32_t NetHub::cancel(const std::string &ownerId, int64_t requestId,
                              std::string &outJson) {
   if (!running()) {
-    return PLUGINXX_NET_ERR_STATE;
+    return net::ErrState;
   }
   auto result = std::make_shared<Json>(Json::object());
   const bool waited = impl_->runSync(
-      [impl = impl_, pluginId, requestId, result] {
-        impl->cancelHttpRequest(pluginId, requestId, *result);
+      [impl = impl_, ownerId, requestId, result] {
+        impl->cancelHttpRequest(ownerId, requestId, *result);
       });
   if (!waited) {
-    return PLUGINXX_NET_ERR_TIMEOUT;
+    return net::ErrTimeout;
   }
   outJson = result->dump();
-  return PLUGINXX_NET_OK;
+  return net::Ok;
 }
 
-std::vector<PluginNetHub::DoneFn>
-PluginNetHub::shutdownPlugin(const std::string &pluginId) {
+std::vector<NetHub::DoneFn>
+NetHub::shutdownOwner(const std::string &ownerId) {
   auto cancelled = std::make_shared<std::vector<DoneFn>>();
   impl_->runSync(
-      [impl = impl_, pluginId, cancelled] {
-        impl->closeAllOf(pluginId, false, cancelled.get());
+      [impl = impl_, ownerId, cancelled] {
+        impl->closeAllOf(ownerId, false, cancelled.get());
       },
       5000);
   return std::move(*cancelled);
 }
 
-std::string PluginNetHub::infoJson(const std::string &pluginId) {
+std::string NetHub::infoJson(const std::string &ownerId) {
   if (!running()) {
-    return errorJson("not_running", "插件网络线程没有运行").dump();
+    return errorJson("not_running", "属主网络线程没有运行").dump();
   }
   auto out = std::make_shared<std::string>(
       errorJson("timeout", "网络线程没有及时回答").dump());
-  impl_->runSync([impl = impl_, pluginId, out] {
-    *out = impl->infoJsonOnThread(pluginId, pluginId.empty());
+  impl_->runSync([impl = impl_, ownerId, out] {
+    *out = impl->infoJsonOnThread(ownerId, ownerId.empty());
   }, 5000);
   return *out;
 }

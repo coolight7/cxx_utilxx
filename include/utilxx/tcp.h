@@ -1,7 +1,7 @@
 /// 裸 TCP（客户端连接 + 监听服务）
 ///
 /// 定位: 给"插件自己收发字节"这类需求用（局域网协议、私有协议、按行/按帧自定）。
-/// 本头只做**字节流**，不做分帧、不做文本解码：一次 `recv` 返回内核这次给到的字节数
+/// 本头只做**字节流**，不做分帧、不做文本解码：一次 `recv` 返回系统这次给到的字节数
 /// （与对端怎么写、什么时候 flush 无关），上层自己攒包。HTTP / WebSocket 请用
 /// `utilxx/http_client.h` / `utilxx/http_server.h` / `utilxx/ws_client.h`。
 ///
@@ -40,7 +40,7 @@ struct UTILXX_API TcpConfig {
     std::chrono::milliseconds connectTimeout = std::chrono::seconds{10};
     /// 单次读 / 写的期限（`0` = 不限；不是"整个连接的空闲超时"）
     std::chrono::milliseconds ioTimeout = std::chrono::seconds{30};
-    /// 一次 `recv` 最多取多少字节（默认 16 KiB，与内核缓冲一次给出的量级一致）
+    /// 一次 `recv` 最多取多少字节（默认 16 KiB，与系统缓冲一次给出的量级一致）
     size_t recvChunk = 16 * 1024;
 };
 
@@ -106,7 +106,7 @@ private:
 /// - `startAsync(ex)` 在给定 executor 上起 accept 循环，**不自建线程**（调用方负责运行
 ///   io_context）；`start()` 会阻塞调用线程直到 `stop()`，适合"自己一个服务占一条线程"的场景；
 /// - 每条连接交给 `onConnection` 协程处理；协程返回即视为这条连接结束（socket 随对象析构关闭）；
-/// - `maxConnections` 到上限时不再 accept（新连接排队在内核 backlog），不无界建对象。
+/// - `maxConnections` 到上限时不再 accept（新连接排队在系统 backlog），不无界建对象。
 class UTILXX_API TcpServer {
 public:
 

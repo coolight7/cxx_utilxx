@@ -1,8 +1,8 @@
 # ===== cxx_utilxx: 重依赖工具库 (HTTP/WS/正则/路由/差异/散列) =====
 #
 # 定位: 基于 cxx_utilxx_base, 提供网络与通用工具; 依赖 OpenSSL / Boost
-# (beast) / fmt / html2md / cxx_pluginxx (只有插件网络宿主需要它的接口表定义:
-# `pluginxx/api/net.h` 是纯头文件, 不引入库符号), 可选 hyperscan (正则);
+# (beast) / fmt / html2md, 可选 hyperscan (正则);
+# `utilxx/net_hub.h` 是通用网络服务 (按属主 id 划分资源), 不依赖任何框架头文件
 # 注: 数据库 (SQLite) 封装、版本管理与工作树 (git worktree) 一类与具体主程序
 # 业务绑定的工具由主程序自行实现, 本库不提供
 # 文件异步 I/O 的 io_uring 依赖在 cxx_utilxx_base (见该库 CMakeLists)
@@ -66,9 +66,6 @@ find_package(Boost CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(fmt REQUIRED)
 find_package(html2md REQUIRED)
-# 插件网络宿主 (`utilxx/plugin_net_hub.h`) 的公开头包含 `pluginxx/api/net.h`:
-# 结果码与 `PluginxxNetIface` 定义在插件框架库里, 所以这里要拿到它的头 (库本身只用宏)。
-find_package(cxx_pluginxx REQUIRED)
 # 依赖库本体 (config 内含 find_dependency 链, 但条件依赖目标须已由上方查找就绪)
 find_package(cxx_utilxx_base REQUIRED)
 
@@ -77,8 +74,8 @@ set(_CXX_UTILXX_SOURCES
   src/http_client.cpp
   src/http_header.cpp
   src/http_server.cpp
-  src/plugin_net_hub.cpp
-  src/plugin_net_hub_tls.cpp
+  src/net_hub.cpp
+  src/net_hub_tls.cpp
   src/regex.cpp
   src/tcp.cpp
   src/udp.cpp
@@ -162,8 +159,6 @@ set(_CXX_UTILXX_LINK_LIBS
   OpenSSL::SSL
   OpenSSL::Crypto
   html2md
-  # 插件网络宿主只需要它的头 (通用表定义); 静态库不会拉进未引用的目标文件
-  cxx_pluginxx_static
 )
 list(APPEND _CXX_UTILXX_LINK_LIBS ${_CXX_UTILXX_EXTRA_LIBS})
 

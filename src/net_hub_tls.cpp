@@ -1,18 +1,18 @@
 /// 连接读写层的 TLS 实现 (客户端)
 ///
-/// 设计与边界见 plugin_net_hub.h / plugin_net_hub_tls.h。要点:
+/// 设计与边界见 net_hub.h / net_hub_tls.h。要点:
 /// - 信任库: 先按 OpenSSL 的默认路径 (`SSL_CERT_FILE` / 编译期 openssldir) 加载, 再补上
 ///   平台的根证书 (Windows: 系统 ROOT 证书库; Linux/macOS/Android: 常见 bundle 文件与
-///   证书目录)。插件给的 `caFile` / `caPem` 是**追加**信任, 不会换掉系统根证书;
+///   证书目录)。属主给的 `caFile` / `caPem` 是**追加**信任, 不会换掉系统根证书;
 /// - 证书校验: 每个连接单独设置 SNI 与主机名校验 (`SSL_set1_host`; IP 字面量走
 ///   `SSL_set1_ip_asc`), 所以同一个 SSL_CTX 可以被不同主机复用;
 /// - 上下文按 (是否校验 + 额外 CA) 缓存, 单条连接不需要重复付 SSL_CTX_new 的开销;
-/// - 协议版本与安全等级的取值与 agentxx 一致: 通用 client 方法 + `SSL_CTX_set_security_level(1)`,
+/// - 协议版本与安全等级的取值与通用 client 方法一致 + `SSL_CTX_set_security_level(1)`,
 ///   对 TLS 1.0 ~ 1.3 自动协商 (只支持旧版本的服务也能连)。
 ///
-/// 这个文件**无条件**编译 OpenSSL 实现: TLS 是插件框架的必备能力, 不存在"某个构建里没有
+/// 这个文件**无条件**编译 OpenSSL 实现: TLS 是调用方框架的必备能力, 不存在"某个构建里没有
 /// https / wss"的版本。缺依赖时在 CMake 配置阶段就报错, 而不是编一个功能残缺的库。
-#include "utilxx/plugin_net_hub_tls.h"
+#include "utilxx/net_hub_tls.h"
 
 #include "utilxx_base/log.h"
 #include "utilxx_base/string_util.h"
@@ -174,7 +174,7 @@ tlsContextFor(const TlsClientOptions &options, std::string &error) {
                            asio::ssl::context::no_sslv3,
                        ec);
   SSL_CTX *raw = context->native_handle();
-  // 与 agentxx 一致: 下限 TLS 1.0, 上限交给 OpenSSL 支持的最高版本
+  // 与本库其它 TLS 入口一致: 下限 TLS 1.0, 上限交给 OpenSSL 支持的最高版本
   ::SSL_CTX_set_min_proto_version(raw, TLS1_VERSION);
   ::SSL_CTX_set_max_proto_version(raw, 0);
   ::SSL_CTX_set_security_level(raw, 1);
@@ -182,7 +182,7 @@ tlsContextFor(const TlsClientOptions &options, std::string &error) {
                                            : asio::ssl::verify_none);
   if (options.verify) {
     // 默认路径 (SSL_CERT_FILE / SSL_CERT_DIR / 编译期 openssldir) 可能一个都没有:
-    // 失败不算错, 真正的信任来自下面的平台根证书与插件给的 CA
+    // 失败不算错, 真正的信任来自下面的平台根证书与属主给的 CA
     context->set_default_verify_paths(ec);
     ::ERR_clear_error();
     X509_STORE *store = ::SSL_CTX_get_cert_store(raw);
@@ -202,7 +202,7 @@ tlsContextFor(const TlsClientOptions &options, std::string &error) {
 
   {
     std::lock_guard<std::mutex> lock(mutex);
-    // 缓存最多留 8 份 (插件换 CA 的场景有限, 避免无界增长)
+    // 缓存最多留 8 份 (属主换 CA 的场景有限, 避免无界增长)
     if (cache.size() >= 8) {
       cache.clear();
     }
