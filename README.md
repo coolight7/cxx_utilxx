@@ -1,20 +1,21 @@
 # cxx_utilxx
 
-重依赖工具库 (网络 / 存储 / 正则 / 进程 / 散列)。
+重依赖工具库 (网络 / 散列 / 进程 / 存储)。
 
 ## 定位
 
 - **用途**: HTTP 客户端与服务端 (Boost.Beast + OpenSSL)、WebSocket 客户端、
   通用网络服务 (HTTP / TCP / WebSocket / UDP 的客户端与服务端 + 按属主 id 隔离,
-  `utilxx/net_hub.h`)、正则 (HyperScan 或 std::regex)、Aho-Corasick、路由、
-  文本差异、MD5/设备标识
+  `utilxx/net_hub.h`)、路由、MD5/设备标识
 - **依赖**: `cxx_utilxx_base` (基础件与取消抽象)、Boost (beast/asio, 仅头文件)、
-  OpenSSL、fmt、html2md; 可选 HyperScan (正则加速, 导出接口以库名
-  `PkgConfig::hyperscan` + `hs_runtime` 声明, 具体库由使用方解析)。
+  OpenSSL、fmt、html2md。
   不依赖任何插件/框架头文件 —— `net_hub` 只认属主 id 字符串, 插件面适配留在主程序。
-  文件异步 I/O 的 io_uring 依赖属 `cxx_utilxx_base` (其 `system.cpp` 使用), 经本库
-  的链接接口间接传递
-- **命名空间**: `utilxx` (与 `cxx_utilxx_base` 的 `utilxx/cancel.h`、`utilxx/async_offload.h` 同一命名空间)
+  文件异步 I/O 的 io_uring 依赖、正则加速的 HyperScan 都属 `cxx_utilxx_base`
+  (分别由其 `system.cpp` 与 `regex.cpp` 使用), 经本库的链接接口间接传递
+- **命名空间**: `utilxx` (与 `cxx_utilxx_base` 的 `utilxx/cancel.h`、`utilxx/async_offload.h`、
+  `utilxx/regex.h`、`utilxx/aho_corasick.h`、`utilxx/diff_util.h` 同一命名空间)
+- 不需要重依赖库的算法与文本工具 (正则 / Aho-Corasick / 逐行 diff) 已搬到
+  `cxx_utilxx_base`, 本库只留网络、TLS、散列与路由
 - **禁止**依赖任何业务引擎 (图引擎/数据库等) 与主程序业务头文件
 - 与具体业务绑定的工具 (数据库封装、全局设置库、git 工作树等) 由主程序自行实现，
   本库不提供
@@ -26,10 +27,9 @@
 ```
 include/utilxx/
   http_client.h  http_header.h  http_error.h  http_server.h  ws_client.h
-  router.h  regex.h  aho_corasick.h
-  diff_util.h  crypto.h
-  net_hub.h  net_hub_tls.h   # 通用网络服务 (HTTP/TCP/WS/UDP, 按属主 id 隔离)
-src/                    实现 (crypto/http_client/http_header/http_server/regex/ws_client
+  router.h  net_hub.h  net_hub_tls.h   # 通用网络服务 (HTTP/TCP/WS/UDP, 按属主 id 隔离)
+  crypto.h                            # MD5 / 设备标识
+src/                    实现 (crypto/http_client/http_header/http_server/ws_client
                         /net_hub/net_hub_tls)
 ```
 
@@ -41,7 +41,7 @@ if (CXX_UTILXX_BASE_LINUX_IO_URING_SUPPORTED)  # cxx_utilxx_base 声明该依赖
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(uring REQUIRED IMPORTED_TARGET liburing)
 endif ()
-if (CXX_UTILXX_ENABLE_HYPERSCAN)               # 本库声明该依赖
+if (CXX_UTILXX_BASE_ENABLE_HYPERSCAN)          # cxx_utilxx_base 声明该依赖
   pkg_check_modules(hyperscan REQUIRED IMPORTED_TARGET libhs)
 endif ()
 find_package(cxx_utilxx REQUIRED)   # 内部 find_dependency(cxx_utilxx_base) 链解析其余依赖
@@ -50,15 +50,14 @@ target_link_libraries(your_target PRIVATE cxx_utilxx_static)  # 或 cxx_utilxx_s
 
 - 产物命名: Release `libcxx_utilxx.so` / `libcxx_utilxx_static.a`,
   Debug 追加 `d` → `libcxx_utilxxd.so` / `libcxx_utilxx_staticd.a`
-- 可选特性由 CMake 开关控制: `CXX_UTILXX_ENABLE_HYPERSCAN` (正则实现)
+- 可选特性由 CMake 开关控制: 无 (正则加速等可选依赖在 `cxx_utilxx_base`)
 - **条件依赖只声明库名, 使用方在本机 find (顺序: 先依赖库的依赖, 再依赖库本体)**:
-  开启 HyperScan 后导出接口里出现的是 `PkgConfig::hyperscan` 与裸库名 `hs_runtime`
-  (**名称**, 与 `fmt::fmt`/`OpenSSL::SSL` 同类), 不含库文件路径。静态库不携带依赖二进制,
-  具体库由使用方在自己机器上解析: 须**先**在自身 CMakeLists 的依赖查找段写
-  `pkg_check_modules(hyperscan REQUIRED IMPORTED_TARGET libhs)`
-  (`hs_runtime` 经 `INTERFACE_LINK_DIRECTORIES` 里的安装目录以裸库名解析, 无需 find),
-  **再** `find_package(cxx_utilxx)` —— 顺序颠倒会报 "target ... not found";
-  本库 PUBLIC 依赖的 `cxx_utilxx_base` 声明的 `PkgConfig::uring` 同理须先查找
+  本库依赖的 `cxx_utilxx_base` 的导出接口里可能出现 `PkgConfig::uring`、
+  `PkgConfig::hyperscan`/`hs_runtime` 这些**名称**(与 `fmt::fmt`/`OpenSSL::SSL` 同类),
+  不含任何库文件路径 —— 静态库不携带依赖二进制, 具体库由使用方在自己机器上解析:
+  须**先**在自身 CMakeLists 的依赖查找段按 `cxx_utilxx_base` 的开关写好 `pkg_check_modules`,
+  **再** `find_package(cxx_utilxx)` (导出目标会校验 INTERFACE 引用的目标是否
+  已存在, 顺序颠倒会报 "target ... not found")
 
 ```c++
 #include "utilxx/http_client.h"
@@ -89,9 +88,9 @@ offloadCancellableAsync 卸载到线程池, 避免阻塞 io_context 线程; 取�
 
 ## 平台
 
-Linux / Windows / macOS / Android / iOS 均可编译; HyperScan 与 io_uring 仅在
-Linux (HyperScan 另支持 Windows 受限支持) 生效, 未启用时自动回退 std::regex /
-同步文件 I/O。
+Linux / Windows / macOS / Android / iOS 均可编译。HyperScan 与 io_uring 仅在
+Linux 生效 (HyperScan 另支持 Windows 受限支持), 两者都属 `cxx_utilxx_base`,
+未启用时自动回退 std::regex / 同步文件 I/O。
 
 ## 导出面
 

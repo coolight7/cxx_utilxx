@@ -1,10 +1,11 @@
-# ===== cxx_utilxx: 重依赖工具库 (HTTP/WS/正则/路由/差异/散列) =====
+# ===== cxx_utilxx: 重依赖工具库 (HTTP/WS/散列/路由) =====
 #
-# 定位: 基于 cxx_utilxx_base, 提供网络与通用工具; 依赖 OpenSSL / Boost
-# (beast) / fmt / html2md, 可选 hyperscan (正则);
+# 定位: 基于 cxx_utilxx_base, 提供网络与散列工具; 依赖 OpenSSL / Boost
+# (beast) / fmt / html2md;
 # `utilxx/net_hub.h` 是通用网络服务 (按属主 id 划分资源), 不依赖任何框架头文件
-# 注: 数据库 (SQLite) 封装、版本管理与工作树 (git worktree) 一类与具体主程序
-# 业务绑定的工具由主程序自行实现, 本库不提供
+# 注: 不需要重依赖库的算法与文本工具 (utilxx/regex.h、utilxx/aho_corasick.h、
+# utilxx/diff_util.h) 已移到 cxx_utilxx_base; 数据库 (SQLite) 封装、版本管理与
+# 工作树 (git worktree) 一类与具体主程序业务绑定的工具由主程序自行实现, 本库不提供
 # 文件异步 I/O 的 io_uring 依赖在 cxx_utilxx_base (见该库 CMakeLists)
 # 产物 (命名规则: Release 无后缀, Debug 文件名追加 d):
 #   Release: libcxx_utilxx.so        libcxx_utilxx_static.a
@@ -15,7 +16,7 @@
 #     find_package(PkgConfig REQUIRED)
 #     pkg_check_modules(uring REQUIRED IMPORTED_TARGET liburing)
 #   endif ()
-#   if (CXX_UTILXX_ENABLE_HYPERSCAN)    # 本库声明该依赖
+#   if (CXX_UTILXX_BASE_ENABLE_HYPERSCAN)  # cxx_utilxx_base 声明该依赖
 #     pkg_check_modules(hyperscan REQUIRED IMPORTED_TARGET libhs)
 #   endif ()
 #   find_package(cxx_utilxx REQUIRED)
@@ -48,8 +49,9 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/xx_platform_macros.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/xx_rpath.cmake")
 
 option(CXX_UTILXX_ENABLE_HYPERSCAN "Use HyperScan for regex (std::regex if off)." OFF)
-# 注: Linux io_uring 依赖 (asio 文件异步 I/O) 已随实现 (system.cpp 的运行时探测)
-# 移到 cxx_utilxx_base, 由该库的 CXX_UTILXX_BASE_LINUX_IO_URING_SUPPORTED 开关处理
+# 注: Linux io_uring 依赖 (asio 文件异步 I/O) 与 HyperScan (正则) 都已随实现
+# 移到 cxx_utilxx_base, 由该库的 CXX_UTILXX_BASE_LINUX_IO_URING_SUPPORTED /
+# CXX_UTILXX_BASE_ENABLE_HYPERSCAN 开关处理
 
 if (NOT DEFINED XX_EXEC_INSTALL_PREFIX)
   set(XX_EXEC_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
@@ -76,31 +78,16 @@ set(_CXX_UTILXX_SOURCES
   src/http_server.cpp
   src/net_hub.cpp
   src/net_hub_tls.cpp
-  src/regex.cpp
   src/tcp.cpp
   src/udp.cpp
   src/ws_client.cpp
 )
 
-# ===== 可选依赖: hyperscan =====
-# 导出接口只**声明依赖库名称**, 不写死库文件路径 (与项目其它库导出接口同为
-# 名称形式: fmt::fmt / OpenSSL::SSL ...), 具体库由处理方在本机 find:
-#   PkgConfig::hyperscan —— 按本库包 config 的开关 cxx_utilxx_ENABLE_HYPERSCAN
-#                           (或本构建开关 CXX_UTILXX_ENABLE_HYPERSCAN) 写
-#                           pkg_check_modules(hyperscan REQUIRED IMPORTED_TARGET libhs),
-#                           主程序构建按其顶层开关判断
-#   hs_runtime           —— HyperScan 运行期库 (libhs.pc 未覆盖), 按裸库名声明,
-#                           经下方 target_link_directories 传播的
-#                           ${XX_INSTALL_DIR}/lib 解析 (该目录只有 .a, 静态链接)
-# io_uring 属 cxx_utilxx_base (其 system.cpp 使用), 依赖经本库 INTERFACE 间接传递
+# HyperScan (正则加速) 与 io_uring (文件异步 I/O) 都随实现搬到了 cxx_utilxx_base:
+# 本库的导出接口只需要 find_dependency(cxx_utilxx_base) 间接带上它们。
 set(_CXX_UTILXX_EXTRA_LIBS "")
 set(_CXX_UTILXX_EXTRA_DEFS "")
-if (CXX_UTILXX_ENABLE_HYPERSCAN)
-  pkg_check_modules(hyperscan REQUIRED IMPORTED_TARGET libhs)
-  list(APPEND _CXX_UTILXX_EXTRA_LIBS PkgConfig::hyperscan hs_runtime)
-  set(_CXX_UTILXX_EXTRA_INCLUDES ${hyperscan_INCLUDE_DIRS})
-  list(APPEND _CXX_UTILXX_EXTRA_DEFS UTILXX_ENABLE_HYPERSCAN=1)
-endif ()
+set(_CXX_UTILXX_EXTRA_INCLUDES "")
 
 # ===== 目标: 静态 + 动态同时产出 =====
 if (XX_IS_MSVC_D)
@@ -197,24 +184,31 @@ unset(_t)
 
 cxx_lib_set_own_dir_rpath(cxx_utilxx_shared)
 
-# ===== 安装与导出 =====
-install(TARGETS cxx_utilxx_shared cxx_utilxx_static
-  EXPORT cxx_utilxxTargets
-  LIBRARY DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
-  RUNTIME DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
-  ARCHIVE DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
-)
-install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
-install(EXPORT cxx_utilxxTargets
-  NAMESPACE ""
-  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
-)
+# 只在自己是顶层工程时安装/导出: 被主工程 add_subdirectory 引入时,
+# 依赖目标 (fmt / simdjson / uchardet / iconv / html2md) 不在同一个导出集里,
+# install(EXPORT) 会报 "requires target ... not in any export set"; 那种用法也不需要安装。
+if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  # ===== 安装与导出 =====
+  install(TARGETS cxx_utilxx_shared cxx_utilxx_static
+    EXPORT cxx_utilxxTargets
+    LIBRARY DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
+    RUNTIME DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
+    ARCHIVE DESTINATION "${XX_EXEC_INSTALL_PREFIX}"
+  )
+  install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+  install(EXPORT cxx_utilxxTargets
+    NAMESPACE ""
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
+  )
 
-configure_package_config_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cxx_utilxxConfig.cmake.in"
-  "${CMAKE_CURRENT_BINARY_DIR}/cxx_utilxxConfig.cmake"
-  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
-)
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/cxx_utilxxConfig.cmake"
-  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
-)
+  configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cxx_utilxxConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/cxx_utilxxConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
+  )
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/cxx_utilxxConfig.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/cxx_utilxx"
+  )
+else ()
+  message(STATUS "[cxx_utilxx] add_subdirectory 引入: 跳过 install/export")
+endif ()
