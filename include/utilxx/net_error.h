@@ -11,7 +11,7 @@
 // - 每个码都要有返回点，没有生产者的码不加；
 // - 名称是对外契约（JSON 里的 `error`、插件的判断都按它），改名等于改协议。
 
-#include <cstdint>
+#include <stdint.h>
 
 #define UTILXX_NET_ERR_INVALID_URL (-100)
 #define UTILXX_NET_ERR_INVALID_HOST (-101)
@@ -25,6 +25,7 @@
 #define UTILXX_NET_ERR_UNSUPPORTED_OP (-109)
 #define UTILXX_NET_ERR_CANCELED (-110)
 
+#ifdef __cplusplus
 namespace utilxx {
 namespace net_error {
 
@@ -50,3 +51,5 @@ inline const char* nameOf(int32_t code) {
 
 }  // namespace net_error
 }  // namespace utilxx
+
+#endif  // __cplusplus
