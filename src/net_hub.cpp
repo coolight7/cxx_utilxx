@@ -12,6 +12,7 @@
 
 #include "utilxx/net_hub.h"
 
+#include "utilxx/net_error.h"
 #include "utilxx/net_hub_tls.h"
 
 #include "utilxx/http_client.h"
@@ -350,6 +351,18 @@ Json errorJson(std::string_view code, std::string_view message) {
   out["error"] = std::string{code};
   out["message"] = std::string{message};
   return out;
+}
+
+/// 网络段返回码 → 结果 JSON
+///
+/// 网络段（-100 ~ -199）的码定义在 `utilxx/net_error.h`；JSON 里写的仍是**名称**
+/// （插件按名称判断），数字只出现在 C / FFI 边界。
+/// 通用段（参数 / 状态 / 超时…）的码定义在 `pluginxx/api/result.h`，utilxx 不能反向依赖它，
+/// 所以那些地方直接写名称（`invalid_argument` / `invalid_json` / `busy` / `not_found` / `timeout`）。
+Json errorJson(int32_t code, std::string_view message) {
+  const char* name = utilxx::net_error::nameOf(code);
+  return errorJson(name ? std::string_view{name} : std::string_view{"unknown_net_error"},
+                   message);
 }
 
 /// JSON 值的文本形式 (字符串原样, 其它类型 dump; 头字段值用)
@@ -1652,14 +1665,14 @@ bool NetHub::Impl::addStaticRoute(const std::shared_ptr<Server> &server,
     return false;
   }
   if (server->routes.size() >= kMaxStaticRoutes) {
-    out = errorJson("too_many", "静态路由已达上限 (" +
+    out = errorJson("busy", "静态路由已达上限 (" +
                                    std::to_string(kMaxStaticRoutes) + " 条)");
     return false;
   }
   auto route = std::make_shared<Server::StaticRoute>();
   std::string err;
   if (!buildStaticRoute(*server, args, route, err)) {
-    out = errorJson("bad_args", err);
+    out = errorJson("invalid_argument", err);
     return false;
   }
   const std::string wantedPath{trimAscii(args.value("path", std::string{}))};
@@ -2145,7 +2158,7 @@ void NetHub::Impl::closeAllOf(const std::string &owner, bool allOwners,
     }
   }
   for (const auto &item : waits) {
-    Json event = errorJson("cancelled", "属主已卸载或调用方框架已停止");
+    Json event = errorJson(UTILXX_NET_ERR_CANCELED, "属主已卸载或调用方框架已停止");
     event["kind"] = "http.response";
     event["requestId"] = item.first;
     emit(item.second, std::move(event));
@@ -2540,12 +2553,12 @@ bool NetHub::Impl::startHttpRequest(const std::string &owner,
                                           DoneFn done, Json &out,
                                           int32_t mode) {
   if (!args.is_object()) {
-    out = errorJson("bad_args", "参数必须是对象");
+    out = errorJson("invalid_argument", "参数必须是对象");
     return false;
   }
   const std::string url = args.value("url", std::string{});
   if (url.empty()) {
-    out = errorJson("bad_args", "缺少 url");
+    out = errorJson("invalid_argument", "缺少 url");
     return false;
   }
   size_t active = 0;
@@ -2555,7 +2568,7 @@ bool NetHub::Impl::startHttpRequest(const std::string &owner,
     }
   }
   if (active >= kMaxHttpClientsPerOwner) {
-    out = errorJson("too_many_requests", "同时在进行的 HTTP 请求过多");
+    out = errorJson("busy", "同时在进行的 HTTP 请求过多");
     return false;
   }
 
@@ -2578,7 +2591,7 @@ bool NetHub::Impl::startHttpRequest(const std::string &owner,
   if (!bodyBase64.empty()) {
     const auto decoded = utilxx_base::base64Decode(bodyBase64);
     if (!decoded.has_value()) {
-      out = errorJson("bad_base64", "bodyBase64 解不开");
+      out = errorJson("invalid_argument", "bodyBase64 解不开");
       return false;
     }
     client->body = *decoded;
@@ -2609,7 +2622,7 @@ bool NetHub::Impl::startHttpRequest(const std::string &owner,
   // 正文形态: `markdown` 时把 HTML 转成 Markdown (只对 request / fetch 有意义)
   const std::string format = args.value("format", std::string{});
   if (!format.empty() && format != "markdown") {
-    out = errorJson("bad_args", "format 只支持 markdown（不给就是原样）");
+    out = errorJson("invalid_argument", "format 只支持 markdown（不给就是原样）");
     return false;
   }
   if (static_cast<HttpMode>(mode) != HttpMode::Download) {
@@ -2623,11 +2636,11 @@ bool NetHub::Impl::startHttpRequest(const std::string &owner,
   } else if (client->mode == HttpMode::Download) {
     // 下载只做 GET 落盘 (与 `http.download` 的参数/行为一致)
     if (client->method != "GET") {
-      out = errorJson("bad_args", "下载只支持 GET");
+      out = errorJson("invalid_argument", "下载只支持 GET");
       return false;
     }
     if (dataDir.empty()) {
-      out = errorJson("no_data_dir",
+      out = errorJson(UTILXX_NET_ERR_WRITE_FAILED,
                       "属主数据目录未就绪 (host_config.data_dir 为空), 不能下载到本地");
       return false;
     }
@@ -2639,7 +2652,7 @@ bool NetHub::Impl::startHttpRequest(const std::string &owner,
     std::error_code dirEc;
     std::filesystem::create_directories(client->downloadDir, dirEc);
     if (dirEc) {
-      out = errorJson("write_failed", "下载目录建不出来: " + client->downloadDir +
+      out = errorJson(UTILXX_NET_ERR_WRITE_FAILED, "下载目录建不出来: " + client->downloadDir +
                                           " (" + errorTextOf(dirEc) + ")");
       return false;
     }
@@ -2690,7 +2703,7 @@ void NetHub::Impl::cancelHttpRequest(const std::string &owner,
   }
   auto client = it->second.client;
   if (client) {
-    client->fail("cancelled", "请求已取消");
+    client->fail("canceled", "请求已取消");
   }
   out = Json::object();
   out["ok"] = true;
@@ -2779,7 +2792,7 @@ asio::awaitable<void> NetHub::Impl::onTcpAccepted(
   tcp->remote = tcp->tcpConn->peerAddress();
   tcp->local = tcp->tcpConn->localAddress();
   if (!registerStream(tcp)) {
-    tcp->closeStream("error", "too_many");
+    tcp->closeStream("error", "busy");
     co_return;
   }
   Json event;
@@ -3075,7 +3088,7 @@ asio::awaitable<void> NetHub::Impl::onWsAccepted(
   stream->server = server;
   stream->roleClient = false;
   if (!registerStream(stream)) {
-    stream->closeStream("error", "too_many");
+    stream->closeStream("error", "busy");
     co_return;
   }
   Json headers = Json::object();
@@ -3249,7 +3262,7 @@ bool NetHub::Impl::openUdp(const std::string &owner, const Json &args,
                                   Json &out) {
   const std::string wantedId{trimAscii(args.value("id", std::string{}))};
   if (!wantedId.empty() && !isValidId(wantedId)) {
-    out = errorJson("bad_args",
+    out = errorJson("invalid_argument",
                     "id 只能包含字母数字与 . _ -（长度 1~64）: " + wantedId);
     return false;
   }
@@ -3260,7 +3273,7 @@ bool NetHub::Impl::openUdp(const std::string &owner, const Json &args,
     }
   }
   if (count >= kMaxUdpChannelsPerOwner) {
-    out = errorJson("too_many", "UDP 通道已达上限 (" +
+    out = errorJson("busy", "UDP 通道已达上限 (" +
                                       std::to_string(kMaxUdpChannelsPerOwner) +
                                       " 条)");
     return false;
@@ -3271,7 +3284,7 @@ bool NetHub::Impl::openUdp(const std::string &owner, const Json &args,
       id = "udp" + std::to_string(nextConnSeq.fetch_add(1));
     } while (udpChannels.find(connKeyOf(owner, id)) != udpChannels.end());
   } else if (udpChannels.find(connKeyOf(owner, id)) != udpChannels.end()) {
-    out = errorJson("exists", "已有同 id 的 UDP 通道: " + id);
+    out = errorJson(UTILXX_NET_ERR_EXISTS, "已有同 id 的 UDP 通道: " + id);
     return false;
   }
 
@@ -3285,12 +3298,12 @@ bool NetHub::Impl::openUdp(const std::string &owner, const Json &args,
   AsioErrorCode ec;
   const auto address = asio::ip::make_address(host, ec);
   if (ec) {
-    out = errorJson("bad_host", "绑定地址不是合法的 IP: " + host);
+    out = errorJson(UTILXX_NET_ERR_INVALID_HOST, "绑定地址不是合法的 IP: " + host);
     return false;
   }
   const int64_t rawPort = args.value("port", int64_t{0});
   if (rawPort < 0 || rawPort > 65535) {
-    out = errorJson("bad_port", "端口超出范围");
+    out = errorJson(UTILXX_NET_ERR_INVALID_PORT, "端口超出范围");
     return false;
   }
 
@@ -3309,7 +3322,7 @@ bool NetHub::Impl::openUdp(const std::string &owner, const Json &args,
   socketConfig.reuseAddress = args.value("reuseAddress", true);
   auto opened = utilxx::UdpSocket::openSync(io.get_executor(), socketConfig);
   if (!opened) {
-    out = errorJson("bind_failed", "绑定 " + channel->host + ":" +
+    out = errorJson(UTILXX_NET_ERR_BIND_FAILED, "绑定 " + channel->host + ":" +
                                        std::to_string(channel->port) +
                                        " 失败: " + opened.error());
     return false;
@@ -3335,13 +3348,13 @@ bool NetHub::Impl::openUdp(const std::string &owner, const Json &args,
     const auto groupAddress = asio::ip::make_address(trimAscii(group), joinEc);
     if (joinEc || !groupAddress.is_multicast() || !groupAddress.is_v4()) {
       closeUnannouncedUdp(channel);
-      out = errorJson("bad_group", "不是合法的组播地址 (只支持 IPv4 组播): " + group);
+      out = errorJson(UTILXX_NET_ERR_INVALID_HOST, "不是合法的组播地址 (只支持 IPv4 组播): " + group);
       return false;
     }
     const auto joined = channel->socket->joinMulticast(groupAddress.to_string());
     if (!joined) {
       closeUnannouncedUdp(channel);
-      out = errorJson("join_failed",
+      out = errorJson(UTILXX_NET_ERR_BIND_FAILED,
                       "加入组播组 " + group + " 失败: " + joined.error());
       return false;
     }
@@ -3387,7 +3400,7 @@ bool NetHub::Impl::groupUdp(const std::string &owner, const Json &args,
   AsioErrorCode ec;
   const auto groupAddress = asio::ip::make_address(raw, ec);
   if (ec || !groupAddress.is_multicast() || !groupAddress.is_v4()) {
-    out = errorJson("bad_group", "不是合法的组播地址 (只支持 IPv4 组播): " + raw);
+    out = errorJson(UTILXX_NET_ERR_INVALID_HOST, "不是合法的组播地址 (只支持 IPv4 组播): " + raw);
     return false;
   }
   const auto applied = join
@@ -3430,7 +3443,7 @@ void NetHub::Impl::sendUdp(const std::string &owner, const Json &args,
   }
   const auto channel = it->second;
   if (channel->closing) {
-    out = errorJson("closed", "这条 UDP 通道已关闭");
+    out = errorJson(UTILXX_NET_ERR_NOT_CONNECTED, "这条 UDP 通道已关闭");
     return;
   }
 
@@ -3439,7 +3452,7 @@ void NetHub::Impl::sendUdp(const std::string &owner, const Json &args,
   std::string host{trimAscii(args.value(
       "host", args.value("address", args.value("to", std::string{}))))};
   if (host.empty()) {
-    out = errorJson("bad_args", "缺少目标 host（广播写 255.255.255.255 或子网广播地址）");
+    out = errorJson("invalid_argument", "缺少目标 host（广播写 255.255.255.255 或子网广播地址）");
     return;
   }
   if (host == "localhost") {
@@ -3447,7 +3460,7 @@ void NetHub::Impl::sendUdp(const std::string &owner, const Json &args,
   }
   const int64_t rawPort = args.value("port", int64_t{channel->port});
   if (rawPort <= 0 || rawPort > 65535) {
-    out = errorJson("bad_port", "目标端口超出范围");
+    out = errorJson(UTILXX_NET_ERR_INVALID_PORT, "目标端口超出范围");
     return;
   }
 
@@ -3456,7 +3469,7 @@ void NetHub::Impl::sendUdp(const std::string &owner, const Json &args,
   if (!base64.empty()) {
     const auto decoded = utilxx_base::base64Decode(base64);
     if (!decoded.has_value()) {
-      out = errorJson("bad_base64", "dataBase64 解不开");
+      out = errorJson("invalid_argument", "dataBase64 解不开");
       return;
     }
     payload = *decoded;
@@ -3467,7 +3480,7 @@ void NetHub::Impl::sendUdp(const std::string &owner, const Json &args,
     }
   }
   if (payload.empty()) {
-    out = errorJson("bad_args", "没有要发送的内容 (data / text / dataBase64)");
+    out = errorJson("invalid_argument", "没有要发送的内容 (data / text / dataBase64)");
     return;
   }
 
@@ -3602,7 +3615,7 @@ void NetHub::Impl::sendConn(const std::string &owner, const Json &args,
                                   Json &out) {
   const std::string id = args.value("id", std::string{});
   if (id.empty()) {
-    out = errorJson("bad_args", "缺少连接 id");
+    out = errorJson("invalid_argument", "缺少连接 id");
     return;
   }
   const auto stream = findConn(owner, id);
@@ -3611,12 +3624,12 @@ void NetHub::Impl::sendConn(const std::string &owner, const Json &args,
     return;
   }
   if (std::string_view{stream->kind()} != "tcp") {
-    out = errorJson("wrong_kind", "这条连接不是 socket 连接 (WS 连接用 ws.send)");
+    out = errorJson(UTILXX_NET_ERR_WRONG_KIND, "这条连接不是 socket 连接 (WS 连接用 ws.send)");
     return;
   }
   if (auto tcp = std::dynamic_pointer_cast<TcpStream>(stream)) {
     if (tcp->connecting) {
-      out = errorJson("not_connected", "连接还在建立中 (等 socket.connected 再发)");
+      out = errorJson(UTILXX_NET_ERR_NOT_CONNECTED, "连接还在建立中 (等 socket.connected 再发)");
       return;
     }
   }
@@ -3625,7 +3638,7 @@ void NetHub::Impl::sendConn(const std::string &owner, const Json &args,
   if (!base64.empty()) {
     const auto decoded = utilxx_base::base64Decode(base64);
     if (!decoded.has_value()) {
-      out = errorJson("bad_base64", "dataBase64 解不开");
+      out = errorJson("invalid_argument", "dataBase64 解不开");
       return;
     }
     payload = *decoded;
@@ -3636,7 +3649,7 @@ void NetHub::Impl::sendConn(const std::string &owner, const Json &args,
     }
   }
   if (payload.empty()) {
-    out = errorJson("bad_args", "没有要发送的内容 (data / dataBase64)");
+    out = errorJson("invalid_argument", "没有要发送的内容 (data / dataBase64)");
     return;
   }
   std::string err;
@@ -3782,7 +3795,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
                                        const std::string &op, const Json &args,
                                        Json &out) {
   if (!args.is_object()) {
-    out = errorJson("bad_args", "参数必须是对象");
+    out = errorJson("invalid_argument", "参数必须是对象");
     return net::Ok;
   }
 
@@ -3811,14 +3824,14 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
   if (op == "http.serve") {
     std::string id = args.value("id", std::string{});
     if (!id.empty() && !isValidId(id)) {
-      out = errorJson("bad_id", "id 只能包含字母数字与 . _ -");
+      out = errorJson(UTILXX_NET_ERR_INVALID_ID, "id 只能包含字母数字与 . _ -");
       return net::Ok;
     }
     if (id.empty()) {
       id = nextServerId(owner, "http");
     }
     if (findServer(owner, "http", id)) {
-      out = errorJson("exists", "同名的 HTTP 服务已经存在");
+      out = errorJson(UTILXX_NET_ERR_EXISTS, "同名的 HTTP 服务已经存在");
       return net::Ok;
     }
     auto server = std::make_shared<Server>();
@@ -3828,7 +3841,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     server->host = args.value("host", std::string{"127.0.0.1"});
     const int64_t port = args.value("port", int64_t{0});
     if (port < 0 || port > 65535) {
-      out = errorJson("bad_port", "端口超出范围");
+      out = errorJson(UTILXX_NET_ERR_INVALID_PORT, "端口超出范围");
       return net::Ok;
     }
     server->port = static_cast<uint16_t>(port);
@@ -3846,12 +3859,12 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     std::vector<std::shared_ptr<Server::StaticRoute>> routes;
     if (args.contains("static")) {
       if (!args["static"].is_array()) {
-        out = errorJson("bad_args", "static 必须是数组");
+        out = errorJson("invalid_argument", "static 必须是数组");
         return net::Ok;
       }
       for (const auto &item : args["static"]) {
         if (routes.size() >= kMaxStaticRoutes) {
-          out = errorJson("too_many", "static 条数超过上限 (" +
+          out = errorJson("busy", "static 条数超过上限 (" +
                                          std::to_string(kMaxStaticRoutes) +
                                          " 条)");
           return net::Ok;
@@ -3859,7 +3872,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
         auto route = std::make_shared<Server::StaticRoute>();
         std::string routeErr;
         if (!buildStaticRoute(*server, item, route, routeErr)) {
-          out = errorJson("bad_args", "static 里有一条不合法: " + routeErr);
+          out = errorJson("invalid_argument", "static 里有一条不合法: " + routeErr);
           return net::Ok;
         }
         routes.push_back(std::move(route));
@@ -3868,7 +3881,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     server->routes = routes;
     std::string err;
     if (!listenServer(server, err)) {
-      out = errorJson("listen_failed", err);
+      out = errorJson(UTILXX_NET_ERR_BIND_FAILED, err);
       return net::Ok;
     }
     out = Json::object();
@@ -3893,7 +3906,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     const std::string serverId =
         args.value("serverId", args.value("id", std::string{}));
     if (serverId.empty()) {
-      out = errorJson("bad_args", "要给 serverId");
+      out = errorJson("invalid_argument", "要给 serverId");
       return net::Ok;
     }
     auto server = findServer(owner, "http", serverId);
@@ -3904,7 +3917,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     if (op == "http.unroute") {
       const std::string path{trimAscii(args.value("path", std::string{}))};
       if (path.empty()) {
-        out = errorJson("bad_args", "要给 path");
+        out = errorJson("invalid_argument", "要给 path");
         return net::Ok;
       }
       out = Json::object();
@@ -3950,26 +3963,26 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     const std::string host = args.value("host", std::string{});
     const int64_t port = args.value("port", int64_t{0});
     if (host.empty() || port <= 0 || port > 65535) {
-      out = errorJson("bad_args", "host / port 不合法");
+      out = errorJson("invalid_argument", "host / port 不合法");
       return net::Ok;
     }
     std::string id = args.value("id", std::string{});
     if (!id.empty() && !isValidId(id)) {
-      out = errorJson("bad_id", "id 只能包含字母数字与 . _ -");
+      out = errorJson(UTILXX_NET_ERR_INVALID_ID, "id 只能包含字母数字与 . _ -");
       return net::Ok;
     }
     if (id.empty()) {
       id = nextConnId(owner, "c");
     }
     if (findConn(owner, id)) {
-      out = errorJson("exists", "同名的连接已经存在");
+      out = errorJson(UTILXX_NET_ERR_EXISTS, "同名的连接已经存在");
       return net::Ok;
     }
     auto stream = std::make_shared<TcpStream>(shared_from_this());
     stream->owner = owner;
     stream->id = id;
     if (!registerStream(stream)) {
-      out = errorJson("too_many", "连接数已达上限");
+      out = errorJson("busy", "连接数已达上限");
       return net::Ok;
     }
     out = Json::object();
@@ -3986,14 +3999,14 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
   if (op == "socket.listen") {
     std::string id = args.value("id", std::string{});
     if (!id.empty() && !isValidId(id)) {
-      out = errorJson("bad_id", "id 只能包含字母数字与 . _ -");
+      out = errorJson(UTILXX_NET_ERR_INVALID_ID, "id 只能包含字母数字与 . _ -");
       return net::Ok;
     }
     if (id.empty()) {
       id = nextServerId(owner, "tcp");
     }
     if (findServer(owner, "tcp", id)) {
-      out = errorJson("exists", "同名的服务已经存在");
+      out = errorJson(UTILXX_NET_ERR_EXISTS, "同名的服务已经存在");
       return net::Ok;
     }
     auto server = std::make_shared<Server>();
@@ -4003,7 +4016,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     server->host = args.value("host", std::string{"127.0.0.1"});
     const int64_t port = args.value("port", int64_t{0});
     if (port < 0 || port > 65535) {
-      out = errorJson("bad_port", "端口超出范围");
+      out = errorJson(UTILXX_NET_ERR_INVALID_PORT, "端口超出范围");
       return net::Ok;
     }
     server->port = static_cast<uint16_t>(port);
@@ -4014,7 +4027,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     }
     std::string err;
     if (!listenServer(server, err)) {
-      out = errorJson("listen_failed", err);
+      out = errorJson(UTILXX_NET_ERR_BIND_FAILED, err);
       return net::Ok;
     }
     out = Json::object();
@@ -4080,28 +4093,28 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
       }
     }
     if (url.empty()) {
-      out = errorJson("bad_args", "缺少 url");
+      out = errorJson("invalid_argument", "缺少 url");
       return net::Ok;
     }
     const ParsedUrl target = parseUrl(url);
     if (!target.ok) {
-      out = errorJson("bad_url", target.error);
+      out = errorJson(UTILXX_NET_ERR_INVALID_URL, target.error);
       return net::Ok;
     }
     if (target.scheme != "ws" && target.scheme != "wss") {
-      out = errorJson("unsupported_scheme", "WebSocket 地址只支持 ws:// 或 wss://");
+      out = errorJson(UTILXX_NET_ERR_INVALID_URL, "WebSocket 地址只支持 ws:// 或 wss://");
       return net::Ok;
     }
     std::string id = args.value("id", std::string{});
     if (!id.empty() && !isValidId(id)) {
-      out = errorJson("bad_id", "id 只能包含字母数字与 . _ -");
+      out = errorJson(UTILXX_NET_ERR_INVALID_ID, "id 只能包含字母数字与 . _ -");
       return net::Ok;
     }
     if (id.empty()) {
       id = nextConnId(owner, "w");
     }
     if (findConn(owner, id)) {
-      out = errorJson("exists", "同名的连接已经存在");
+      out = errorJson(UTILXX_NET_ERR_EXISTS, "同名的连接已经存在");
       return net::Ok;
     }
     auto ws = std::make_shared<WsStream>(shared_from_this());
@@ -4127,7 +4140,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
       }
     }
     if (!registerStream(ws)) {
-      out = errorJson("too_many", "连接数已达上限");
+      out = errorJson("busy", "连接数已达上限");
       return net::Ok;
     }
     out = Json::object();
@@ -4142,14 +4155,14 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
   if (op == "ws.listen") {
     std::string id = args.value("id", std::string{});
     if (!id.empty() && !isValidId(id)) {
-      out = errorJson("bad_id", "id 只能包含字母数字与 . _ -");
+      out = errorJson(UTILXX_NET_ERR_INVALID_ID, "id 只能包含字母数字与 . _ -");
       return net::Ok;
     }
     if (id.empty()) {
       id = nextServerId(owner, "ws");
     }
     if (findServer(owner, "ws", id)) {
-      out = errorJson("exists", "同名的服务已经存在");
+      out = errorJson(UTILXX_NET_ERR_EXISTS, "同名的服务已经存在");
       return net::Ok;
     }
     auto server = std::make_shared<Server>();
@@ -4159,7 +4172,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     server->host = args.value("host", std::string{"127.0.0.1"});
     const int64_t port = args.value("port", int64_t{0});
     if (port < 0 || port > 65535) {
-      out = errorJson("bad_port", "端口超出范围");
+      out = errorJson(UTILXX_NET_ERR_INVALID_PORT, "端口超出范围");
       return net::Ok;
     }
     server->port = static_cast<uint16_t>(port);
@@ -4171,7 +4184,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     }
     std::string err;
     if (!listenServer(server, err)) {
-      out = errorJson("listen_failed", err);
+      out = errorJson(UTILXX_NET_ERR_BIND_FAILED, err);
       return net::Ok;
     }
     out = Json::object();
@@ -4198,7 +4211,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     }
     const auto ws = std::dynamic_pointer_cast<WsStream>(stream);
     if (!ws) {
-      out = errorJson("wrong_kind", "这条连接不是 WebSocket 连接");
+      out = errorJson(UTILXX_NET_ERR_WRONG_KIND, "这条连接不是 WebSocket 连接");
       return net::Ok;
     }
     int32_t opcode = 1;
@@ -4207,7 +4220,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
     if (!base64.empty()) {
       const auto decoded = utilxx_base::base64Decode(base64);
       if (!decoded.has_value()) {
-        out = errorJson("bad_base64", "dataBase64 解不开");
+        out = errorJson("invalid_argument", "dataBase64 解不开");
         return net::Ok;
       }
       payload = *decoded;
@@ -4218,7 +4231,7 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
         payload = args.value("data", std::string{});
       }
       if (payload.empty()) {
-        out = errorJson("bad_args", "没有要发送的内容 (text / data / dataBase64)");
+        out = errorJson("invalid_argument", "没有要发送的内容 (text / data / dataBase64)");
         return net::Ok;
       }
     }
@@ -4399,11 +4412,11 @@ int32_t NetHub::callAsync(const std::string &ownerId,
                                 const std::string &argsJson, DoneFn done,
                                 std::string &outJson, int64_t *outRequestId) {
   if (!running()) {
-    outJson = errorJson("not_running", "属主网络线程没有运行").dump();
+    outJson = errorJson(UTILXX_NET_ERR_NOT_CONNECTED, "属主网络线程没有运行").dump();
     return net::ErrState;
   }
   if (op != "http.request" && op != "http.fetch" && op != "http.download") {
-    outJson = errorJson("unsupported_op", "这个操作没有异步形态").dump();
+    outJson = errorJson(UTILXX_NET_ERR_UNSUPPORTED_OP, "这个操作没有异步形态").dump();
     return net::ErrArg;
   }
   const int32_t mode =
@@ -4411,7 +4424,7 @@ int32_t NetHub::callAsync(const std::string &ownerId,
   bool parsed = false;
   Json args = parseJsonSafe(argsJson, &parsed);
   if (!parsed) {
-    outJson = errorJson("bad_json", "参数不是合法 JSON").dump();
+    outJson = errorJson("invalid_json", "参数不是合法 JSON").dump();
     return net::ErrJson;
   }
   const int64_t requestId = impl_->allocateRequestId();
@@ -4467,7 +4480,7 @@ NetHub::shutdownOwner(const std::string &ownerId) {
 
 std::string NetHub::infoJson(const std::string &ownerId) {
   if (!running()) {
-    return errorJson("not_running", "属主网络线程没有运行").dump();
+    return errorJson(UTILXX_NET_ERR_NOT_CONNECTED, "属主网络线程没有运行").dump();
   }
   auto out = std::make_shared<std::string>(
       errorJson("timeout", "网络线程没有及时回答").dump());
