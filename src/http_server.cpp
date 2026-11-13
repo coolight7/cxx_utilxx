@@ -141,7 +141,7 @@ HttpServer::HttpServer(Config config) :
 
 HttpServer::~HttpServer() {
     stop();
-    // 挂在 io_context 上的协程帧在 `~io_context` 时才销毁, 而它们的清理钩子
+    // 挂在 io_context 上的协程帧在 `~io_context` 时才销毁, 而它们的清理回调
     // (`serveTcp` 的 `Untracker`) 会回调 `untrackConnection` 去碰 `connMutex_` /
     // `trackedConns_`。这两个成员声明在 `workers_` 之后, 默认析构会先把它们拆掉,
     // 于是回调去用一个已释放的 mutex/vector (debug STL 报 "vector erase iterator
