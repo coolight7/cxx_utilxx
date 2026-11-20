@@ -113,30 +113,16 @@ std::string osTextToUtf8(const std::string &text) {
 
 /// 单条连接一次读的字节数
 constexpr size_t kReadChunk = 16 * 1024;
-/// 请求头 / 响应头上限
-constexpr size_t kMaxHeadBytes = 16 * 1024;
 /// HTTP 正文上限 (请求与响应共用; 超过按 413 / truncated 处理)
 constexpr int64_t kMaxHttpBody = 8 * 1024 * 1024;
 /// WebSocket 单条消息上限
 constexpr int64_t kMaxWsMessage = 8 * 1024 * 1024;
 /// 单条连接的发送队列上限 (背压)
 constexpr size_t kMaxOutQueue = 4 * 1024 * 1024;
-/// 单个 HTTP 服务最多登记几条静态路由
-constexpr size_t kMaxStaticRoutes = 1024;
 /// 单条内存内容路由的上限 (大内容清用文件)
 constexpr int64_t kMaxStaticBytes = 8 * 1024 * 1024;
 /// 静态路由 URL 尾段里的文件名长度上限 (只用于展示)
 constexpr size_t kMaxStaticFileName = 120;
-/// 每个属主最多几个同类服务
-constexpr int32_t kMaxServersPerKind = 8;
-/// 每个属主最多几条连接 (客户端 + 服务端)
-constexpr size_t kMaxConnectionsPerOwner = 64;
-/// 每个属主最多几个 UDP 通道 (每个通道一个 socket, 防止把进程 fd 用完)
-constexpr size_t kMaxUdpChannelsPerOwner = 32;
-/// 每个属主同时进行的 HTTP 客户端请求
-constexpr size_t kMaxHttpClientsPerOwner = 16;
-/// 每个 HTTP 服务同时等待属主回答的请求
-constexpr size_t kMaxHttpPendingPerServer = 64;
 /// HTTP 客户端默认超时
 constexpr int64_t kDefaultHttpTimeoutMs = 15000;
 /// 同步入口等网络线程的上界
@@ -1446,9 +1432,6 @@ bool NetHub::Impl::registerStream(const std::shared_ptr<Stream> &stream) {
   if (!stream) {
     return false;
   }
-  if (connectionCountOf(stream->owner) >= kMaxConnectionsPerOwner) {
-    return false;
-  }
   conns[connKeyOf(stream->owner, stream->id)] = stream;
   if (!stream->serverId.empty()) {
     const auto server = findServer(stream->owner, stream->kind(), stream->serverId);
@@ -1509,17 +1492,6 @@ std::string NetHub::Impl::nextConnId(const std::string &owner,
 
 bool NetHub::Impl::listenServer(std::shared_ptr<Server> server,
                                       std::string &err) {
-  int32_t sameKind = 0;
-  for (const auto &item : servers) {
-    if (item.second && item.second->owner == server->owner &&
-        item.second->kind == server->kind) {
-      ++sameKind;
-    }
-  }
-  if (sameKind >= kMaxServersPerKind) {
-    err = "同类服务已达上限";
-    return false;
-  }
   if (!resolveBindHost(server->host, err)) {
     return false;
   }
@@ -1662,11 +1634,6 @@ bool NetHub::Impl::addStaticRoute(const std::shared_ptr<Server> &server,
                                         const Json &args, Json &out) {
   if (!server) {
     out = errorJson("not_found", "服务不存在");
-    return false;
-  }
-  if (server->routes.size() >= kMaxStaticRoutes) {
-    out = errorJson("busy", "静态路由已达上限 (" +
-                                   std::to_string(kMaxStaticRoutes) + " 条)");
     return false;
   }
   auto route = std::make_shared<Server::StaticRoute>();
@@ -2044,9 +2011,6 @@ int64_t NetHub::Impl::registerPendingHttp(
     const std::shared_ptr<Server> &server,
     const std::shared_ptr<PendingResponse> &wait) {
   if (!server || !wait) {
-    return 0;
-  }
-  if (server->pending >= kMaxHttpPendingPerServer) {
     return 0;
   }
   const int64_t requestId = allocateRequestId();
@@ -2561,19 +2525,8 @@ bool NetHub::Impl::startHttpRequest(const std::string &owner,
     out = errorJson("invalid_argument", "缺少 url");
     return false;
   }
-  size_t active = 0;
-  for (const auto &item : httpWaits) {
-    if (item.second.owner == owner) {
-      ++active;
-    }
-  }
-  if (active >= kMaxHttpClientsPerOwner) {
-    out = errorJson("busy", "同时在进行的 HTTP 请求过多");
-    return false;
-  }
 
-  auto client = std::make_shared<HttpRequestTask>();
-  client->hub = shared_from_this();
+  auto client = std::make_shared<HttpRequestTask>();  client->hub = shared_from_this();
   client->owner = owner;
   client->requestId = requestId;
   client->url = url;
@@ -2777,8 +2730,7 @@ asio::awaitable<void> NetHub::Impl::onTcpAccepted(
   if (!conn || !server) {
     co_return;
   }
-  if (server->conns.size() >= static_cast<size_t>(server->maxConnections) ||
-      connectionCountOf(server->owner) >= kMaxConnectionsPerOwner) {
+  if (server->conns.size() >= static_cast<size_t>(server->maxConnections)) {
     conn->abort();
     co_return;
   }
@@ -3069,8 +3021,7 @@ asio::awaitable<void> NetHub::Impl::onWsAccepted(
   if (!server->pathPrefix.empty() && !startsWith(path, server->pathPrefix)) {
     co_return;
   }
-  if (server->conns.size() >= static_cast<size_t>(server->maxConnections) ||
-      connectionCountOf(server->owner) >= kMaxConnectionsPerOwner) {
+  if (server->conns.size() >= static_cast<size_t>(server->maxConnections)) {
     co_return;
   }
   utilxx::WsClientConfig config;
@@ -3264,18 +3215,6 @@ bool NetHub::Impl::openUdp(const std::string &owner, const Json &args,
   if (!wantedId.empty() && !isValidId(wantedId)) {
     out = errorJson("invalid_argument",
                     "id 只能包含字母数字与 . _ -（长度 1~64）: " + wantedId);
-    return false;
-  }
-  size_t count = 0;
-  for (const auto &item : udpChannels) {
-    if (item.second && item.second->owner == owner) {
-      ++count;
-    }
-  }
-  if (count >= kMaxUdpChannelsPerOwner) {
-    out = errorJson("busy", "UDP 通道已达上限 (" +
-                                      std::to_string(kMaxUdpChannelsPerOwner) +
-                                      " 条)");
     return false;
   }
   std::string id = wantedId;
@@ -3775,18 +3714,9 @@ std::string NetHub::Impl::infoJsonOnThread(const std::string &owner,
   out["httpClients"] = static_cast<int64_t>(httpClients);
   out["udp"] = udpInfoJson(owner, allOwners);
   Json limits = Json::object();
-  limits["maxServersPerKind"] = kMaxServersPerKind;
-  limits["maxConnectionsPerOwner"] =
-      static_cast<int64_t>(kMaxConnectionsPerOwner);
-  limits["maxHttpClientsPerOwner"] =
-      static_cast<int64_t>(kMaxHttpClientsPerOwner);
-  limits["maxHttpPendingPerServer"] =
-      static_cast<int64_t>(kMaxHttpPendingPerServer);
   limits["maxHttpBodyBytes"] = kMaxHttpBody;
   limits["maxWsMessageBytes"] = kMaxWsMessage;
   limits["maxOutQueueBytes"] = static_cast<int64_t>(kMaxOutQueue);
-  limits["maxUdpChannelsPerOwner"] =
-      static_cast<int64_t>(kMaxUdpChannelsPerOwner);
   out["limits"] = std::move(limits);
   return out.dump();
 }
@@ -3863,12 +3793,6 @@ int32_t NetHub::Impl::handleCall(const std::string &owner,
         return net::Ok;
       }
       for (const auto &item : args["static"]) {
-        if (routes.size() >= kMaxStaticRoutes) {
-          out = errorJson("busy", "static 条数超过上限 (" +
-                                         std::to_string(kMaxStaticRoutes) +
-                                         " 条)");
-          return net::Ok;
-        }
         auto route = std::make_shared<Server::StaticRoute>();
         std::string routeErr;
         if (!buildStaticRoute(*server, item, route, routeErr)) {
