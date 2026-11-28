@@ -75,6 +75,10 @@ void enableTcpKeepalive(Socket& sock) noexcept {
 ///
 /// 语义: 在 timeout 内执行 op; 超时则强制关闭连接并抛 std::runtime_error;
 /// op 自身抛出的异常 (eof/stream_truncated 等) 原样传播 (不会退化为等待超时)。
+///
+/// 关键约束: op 结束之后计时器回调**不再关连接**。SSE 收尾在后台协程里跑, 它结束就把
+/// 连接还回池了, 晚到的回调如果还去 close, 就会让下一条借到这条连接的请求直接失败
+/// (bad_descriptor / Windows 10009)。见下方 `running` 标记。
 template<typename Stream, typename Op>
 asio::awaitable<void> runSseOpWithTimeout(
     Stream&                   stream,
@@ -87,12 +91,22 @@ asio::awaitable<void> runSseOpWithTimeout(
     // 共享状态: timer 回调可能晚于协程迭代/退出执行, 必须堆分配避免悬空引用
     auto timer    = std::make_shared<asio::steady_timer>(ex, timeout);
     auto timedOut = std::make_shared<std::atomic<bool>>(false);
+    // 本段操作是否还在进行: 协程退出前**先**置 false, 之后到达的计时器回调不再关连接
+    //
+    // 为什么要这个标记: 回调可能在操作完成之后才被调用。此时连接可能已经交回连接池
+    // 并被下一条请求借走, 关掉它就是让别人拿到一条本地已关闭的 socket
+    // (表现为下一条请求立刻失败 `bad_descriptor` / Windows 10009)。
+    // 单线程事件循环下, 回调要么在协程恢复前跑 (正常打断操作), 要么看到 false 后什么都不做。
+    auto running = std::make_shared<std::atomic<bool>>(true);
 
-    // 协程退出 (正常或异常) 时必须取消计时器, 否则其回调可能晚于 stream 销毁执行
+    // 协程退出 (正常或异常) 时必须停止计时器, 否则其回调可能晚于 stream 销毁执行
     struct TimerCleanup {
         asio::steady_timer& timer;
+        std::atomic<bool>&  running;
 
         ~TimerCleanup() {
+            // 先清标记再取消: 已经排队但还没执行的回调会直接返回, 不再关连接
+            running.store(false, std::memory_order_release);
             // 本 asio 版本的 timer::cancel() 只有无参形式 (可能抛异常),
             // 析构函数中不允许抛出, 因此吞掉
             try {
@@ -100,23 +114,37 @@ asio::awaitable<void> runSseOpWithTimeout(
             } catch (...) {
             }
         }
-    } cleanup{*timer};
+    } cleanup{*timer, *running};
 
-    timer->async_wait([timer, timedOut, &stream, stage, timeout](const utilxx_base::AsioErrorCode& ec
-                      ) {
-        if (ec) {
-            return; // 被取消 (操作先完成) 或计时器已销毁
+    timer->async_wait(
+        [timer, timedOut, running, &stream, stage, timeout](const utilxx_base::AsioErrorCode& ec) {
+            if (ec) {
+                return; // 被取消 (操作先完成) 或计时器已销毁
+            }
+            if (!running->load(std::memory_order_acquire)) {
+                return; // 操作已经结束, 这条连接不归本计时器管
+            }
+            timedOut->store(true);
+            // 收尾 (等终止块) 超时是网关不给正文结束标记时的正常结果: 只是这条连接
+            // 不能再复用, 请求本身早已成功返回, 因此不按警告输出 (避免刷屏)
+            if (stage == "finish") {
+                XX_LOGD(
+                    "HttpClient SSE {} timeout after {} ms, closing connection",
+                    stage,
+                    timeout.count()
+                );
+            } else {
+                XX_LOGW(
+                    "HttpClient SSE {} timeout after {} ms, closing connection",
+                    stage,
+                    timeout.count()
+                );
+            }
+            // 强制关闭底层连接: 挂起的读/写会以 operation_aborted 完成, 从而打断协程
+            utilxx_base::AsioErrorCode ignore;
+            stream.lowest_layer().close(ignore);
         }
-        timedOut->store(true);
-        XX_LOGW(
-            "HttpClient SSE {} timeout after {} ms, closing connection",
-            stage,
-            timeout.count()
-        );
-        // 强制关闭底层连接: 挂起的读/写会以 operation_aborted 完成, 从而打断协程
-        utilxx_base::AsioErrorCode ignore;
-        stream.lowest_layer().close(ignore);
-    });
+    );
 
     try {
         co_await std::forward<Op>(op)();
@@ -131,8 +159,8 @@ asio::awaitable<void> runSseOpWithTimeout(
         throw;
     }
 
-    // op 正常完成, 计时器被上方 RAII 取消; 防御性检查: 若恰好同时到期 (单线程
-    // 事件循环下 close 会先于 op 完成执行, 此分支实际不可达) 也按超时处理
+    // op 正常完成, 计时器被上方 RAII 停止; 防御性检查: 计时器恰好已经关掉连接时,
+    // 这条流不能再被复用, 按超时抛出 (调用方据此不还池)
     if (timedOut->load()) {
         throw std::runtime_error(fmt::format("SSE {} timeout after {} ms", stage, timeout.count()));
     }
@@ -473,13 +501,16 @@ inline constexpr auto kPoolWaitTimeout = std::chrono::seconds{30};
 ///   asio 错误消息为中文, 文本匹配不可靠)
 /// - 匹配: eof / connection reset (Windows: WSAECONNRESET 10054) /
 ///   connection aborted (Windows: WSAECONNABORTED 10053, 对端关闭空闲连接后
-///   读写时报此错) / broken pipe / beast end_of_stream
+///   读写时报此错) / broken pipe / beast end_of_stream /
+///   bad_descriptor (本地已关闭的 socket: asio 检查到句柄无效就直接返回,
+///   请求根本没发出去, Windows 上文本是“提供的文件句柄无效” 10009)
 /// - 不匹配 (服务端已接收并处理请求, 重试会造成重复执行, 由上层决定):
 ///   响应截断 (partial message / ssl stream_truncated)、各类超时、取消
 bool isPoolRetryableError(const utilxx_base::AsioErrorCode& ec, std::string_view errmsg) {
     if (ec) {
         if (ec == asio::error::eof || ec == asio::error::connection_reset
-            || ec == asio::error::connection_aborted || ec == asio::error::broken_pipe) {
+            || ec == asio::error::connection_aborted || ec == asio::error::broken_pipe
+            || ec == asio::error::bad_descriptor) {
             return true;
         }
         // beast: 连接在消息边界处关闭 (读下一个请求的响应时立即 EOF)
@@ -1633,8 +1664,12 @@ struct SseTailDrain {
 };
 
 /// 后台收尾: 读到正文结束标记为止 (期间丢弃字节, 不再交给调用方)
+///
+/// 只有在“干净读完 + 正文已完成 + 服务端允许 keep-alive”时才把连接还回池; 超时或读失败
+/// 说明流上还有未读字节, 且连接可能已被计时器关掉, 一律按不可复用关闭。
 asio::awaitable<void> drainSseTail(std::shared_ptr<SseTailDrain> state) {
     const auto deadline = std::chrono::steady_clock::now() + state->grace;
+    bool       clean     = false;
     try {
         co_await std::visit(
             [&](auto& stream) -> asio::awaitable<void> {
@@ -1662,10 +1697,11 @@ asio::awaitable<void> drainSseTail(std::shared_ptr<SseTailDrain> state) {
             },
             state->conn->stream
         );
+        clean = state->parser->is_done();
     } catch (...) {
         // 读超时 / EOF / 解析错误: 连接不可复用, 下面按 false 归还
     }
-    state->release(state->parser->is_done() && state->parser->get().keep_alive());
+    state->release(clean && state->parser->get().keep_alive());
 }
 
 asio::awaitable<void> HttpClient::requestSseAsync(
