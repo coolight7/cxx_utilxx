@@ -25,6 +25,7 @@
 #include <fstream>
 #include <list>
 #include <map>
+#include <mutex>
 #include <openssl/ssl.h>
 #include <openssl/tls1.h> // TLS1_VERSION 等协议版本常量 (enableTlsAutoNegotiate)
 #include <variant>
@@ -108,7 +109,7 @@ asio::awaitable<void> runSseOpWithTimeout(
         }
         timedOut->store(true);
         XX_LOGW(
-            "HttpClient::requestSseAsync {} timeout after {} ms, closing connection",
+            "HttpClient SSE {} timeout after {} ms, closing connection",
             stage,
             timeout.count()
         );
@@ -134,6 +135,54 @@ asio::awaitable<void> runSseOpWithTimeout(
     // 事件循环下 close 会先于 op 完成执行, 此分支实际不可达) 也按超时处理
     if (timedOut->load()) {
         throw std::runtime_error(fmt::format("SSE {} timeout after {} ms", stage, timeout.count()));
+    }
+}
+
+/// 执行一段建连操作 (connect / TLS 握手), 失败时抛带阶段信息的错误
+///
+/// 为什么包一层: 建连超时用的是 `cancel_after`, 到点会以 `operation_aborted`
+/// (Windows 995) 结束, 上层 `classifyCurrentException` 只能把它写成
+/// "timeout: 已中止 I/O 操作" —— 看不出是连接、TLS 还是读响应, 也看不出对应哪个地址。
+/// 这里补上阶段、地址与耗时, 日志与错误文本都能直接定位。
+///
+/// - `operation_aborted` = 我们自己的计时器到点, 文本写成 `... timeout after N ms`
+/// - 其余错误 (连接被拒、TLS 握手失败等) 原样保留在尾部
+template<typename Op>
+asio::awaitable<void> runConnectStage(
+    std::string_view                      stage,
+    const std::string&                    hostPort,
+    std::chrono::steady_clock::time_point startedAt,
+    std::size_t                           endpointCount,
+    Op&&                                  op
+) {
+    try {
+        co_await op();
+    } catch (const utilxx_base::AsioSystemError& e) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - startedAt
+        )
+                                 .count();
+        const bool timedOut = e.code() == asio::error::operation_aborted;
+        XX_LOGW(
+            "[http] {} {} after {} ms (stage={} host={} endpoints={}): {}",
+            stage,
+            timedOut ? "timeout" : "failed",
+            elapsed,
+            stage,
+            hostPort,
+            endpointCount,
+            e.what()
+        );
+        throw std::runtime_error(fmt::format(
+            "{} {} after {} ms (stage={} host={} endpoints={}) | {}",
+            stage,
+            timedOut ? "timeout" : "failed",
+            elapsed,
+            stage,
+            hostPort,
+            endpointCount,
+            e.what()
+        ));
     }
 }
 
@@ -253,6 +302,74 @@ asio::awaitable<asio::ip::tcp::resolver::results_type> waitDnsResolve(
 }
 
 // ---------------------------------------------------------------------------
+// DNS 结果缓存
+//
+// 背景: 每次建连都重新解析域名, 解析器抖动一次就废掉一次请求 (Windows 上实测
+// `11001` 要等 11 秒); 解析服务器不可用时也可能一直等不到结果。缓存解析结果,
+// 并在解析失败/超时时回退到上一次成功的地址 —— 只要地址还能连上, 请求就不必失败
+// (证书仍按域名校验, 地址变化只影响能否建立连接)。
+// ---------------------------------------------------------------------------
+
+struct DnsCacheEntry {
+    asio::ip::tcp::resolver::results_type  results;
+    std::chrono::steady_clock::time_point at;
+};
+
+std::mutex                           g_dnsCacheMtx;
+std::map<std::string, DnsCacheEntry> g_dnsCache;
+std::atomic<int64_t>                 g_dnsCacheTtlMs{60'000};
+std::atomic<size_t>                  g_dnsCacheHits{0};
+std::atomic<size_t>                  g_dnsCacheMisses{0};
+std::atomic<size_t>                  g_dnsCacheStale{0};
+
+std::string dnsCacheKey(std::string_view host, std::string_view port) {
+    std::string key{host};
+    key.push_back(':');
+    key.append(port);
+    return key;
+}
+
+/// 取缓存条目 (不看有效期; 不做统计), 供"解析失败时兜底"使用
+std::optional<asio::ip::tcp::resolver::results_type> dnsCacheFind(const std::string& key) {
+    std::lock_guard<std::mutex> lock(g_dnsCacheMtx);
+    auto                        it = g_dnsCache.find(key);
+    if (it == g_dnsCache.end()) {
+        return std::nullopt;
+    }
+    // results_type 是共享所有权, 拷贝很轻 (只多一个引用计数)
+    return it->second.results;
+}
+
+/// 取未过期的缓存 (命中/未命中都计数)
+std::optional<asio::ip::tcp::resolver::results_type> dnsCacheLookup(const std::string& key) {
+    const auto ttlMs = g_dnsCacheTtlMs.load(std::memory_order_relaxed);
+    if (ttlMs <= 0) {
+        ++g_dnsCacheMisses;
+        return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(g_dnsCacheMtx);
+    auto                        it = g_dnsCache.find(key);
+    if (it == g_dnsCache.end()) {
+        ++g_dnsCacheMisses;
+        return std::nullopt;
+    }
+    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - it->second.at
+    );
+    if (age.count() > ttlMs) {
+        ++g_dnsCacheMisses;
+        return std::nullopt;
+    }
+    ++g_dnsCacheHits;
+    return it->second.results;
+}
+
+void dnsCacheStore(const std::string& key, const asio::ip::tcp::resolver::results_type& results) {
+    std::lock_guard<std::mutex> lock(g_dnsCacheMtx);
+    g_dnsCache[key] = DnsCacheEntry{results, std::chrono::steady_clock::now()};
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 连接池 (keep-alive 连接复用)
 //
 // 背景: 如果每次请求都新建 TCP+TLS 连接、响应后立即关闭, 高频 API 调用时
@@ -341,9 +458,10 @@ asio::awaitable<std::shared_ptr<PooledConnection>>
     createConnection(const HttpPoolKey& key, const RequestConfig& config);
 
 /// 空闲连接最大存活时长: 超过该时长未复用的连接在下次获取时关闭重建。
-/// 多数网关/负载均衡的 keep-alive 空闲超时在 60~75s, 120s 足够覆盖常见复用间隔;
-/// 即使服务端提前断开, 复用失败也会自动用新连接重试一次 (见 isPoolRetryableError)。
-inline constexpr auto kPoolIdleTimeout = std::chrono::seconds{120};
+/// 常见网关/负载均衡的 keep-alive 空闲超时在 60~75s: 取 60s 让空闲窗口落在服务端
+/// 断开之前 (宁可用新连接, 也不撞上已经死掉的连接); 即使服务端提前断开,
+/// 复用失败也会自动用新连接重试一次 (见 isPoolRetryableError)。
+inline constexpr auto kPoolIdleTimeout = std::chrono::seconds{60};
 
 /// 并发上限等待时的备用超时: 正常情况下由 release/建连失败精准唤醒等待队列,
 /// 消除 50ms 忙轮询与突发请求惊群; 30s 作为安全备用超时
@@ -682,6 +800,10 @@ asio::awaitable<std::shared_ptr<PooledConnection>>
 
     auto executor = co_await asio::this_coro::executor;
 
+    // 建连起点与目标 (只用于错误文本与日志)
+    const auto        connectStarted = std::chrono::steady_clock::now();
+    const std::string hostPort       = fmt::format("{}:{}", key.host, key.port);
+
     // connectTimeout 是 DNS + TCP + TLS 的总上限 (各阶段共用剩余时间)
     auto connectDeadline = std::chrono::steady_clock::now() + config.connectTimeout;
     auto remainingMs     = [&]() -> std::chrono::milliseconds {
@@ -727,24 +849,48 @@ asio::awaitable<std::shared_ptr<PooledConnection>>
                 ::X509_VERIFY_PARAM_set1_ip_asc(::SSL_get0_param(ssl), sni.c_str());
             }
         }
-        co_await asio::async_connect(
-            stream.lowest_layer(),
-            endpoints,
-            asio::cancel_after(remainingMs(), asio::use_awaitable)
+        co_await runConnectStage(
+            "connect",
+            hostPort,
+            connectStarted,
+            endpoints.size(),
+            [&]() -> asio::awaitable<void> {
+                co_await asio::async_connect(
+                    stream.lowest_layer(),
+                    endpoints,
+                    asio::cancel_after(remainingMs(), asio::use_awaitable)
+                );
+            }
         );
         utilxx_base::AsioErrorCode tcpEc;
         stream.lowest_layer().set_option(asio::ip::tcp::no_delay(true), tcpEc);
         enableTcpKeepalive(stream.lowest_layer());
-        co_await stream.async_handshake(
-            asio::ssl::stream_base::client,
-            asio::cancel_after(remainingMs(), asio::use_awaitable)
+        co_await runConnectStage(
+            "tls",
+            hostPort,
+            connectStarted,
+            endpoints.size(),
+            [&]() -> asio::awaitable<void> {
+                co_await stream.async_handshake(
+                    asio::ssl::stream_base::client,
+                    asio::cancel_after(remainingMs(), asio::use_awaitable)
+                );
+            }
         );
     } else {
         auto& stream = conn->stream.emplace<tcp::socket>(executor);
-        co_await asio::async_connect(
-            stream,
-            endpoints,
-            asio::cancel_after(remainingMs(), asio::use_awaitable)
+        co_await runConnectStage(
+            "connect",
+            hostPort,
+            connectStarted,
+            endpoints.size(),
+            [&]() -> asio::awaitable<void> {
+                co_await asio::async_connect(
+                    stream,
+                    endpoints,
+                    asio::cancel_after(remainingMs(), asio::use_awaitable)
+                );
+            }
         );
         utilxx_base::AsioErrorCode tcpEc;
         stream.set_option(asio::ip::tcp::no_delay(true), tcpEc);
@@ -756,6 +902,16 @@ asio::awaitable<std::shared_ptr<PooledConnection>>
     asio::use_service<HttpPoolContextGuard>(asio::query(executor, asio::execution::context));
     conn->lastUsed = std::chrono::steady_clock::now();
     conn->fresh    = true;
+    XX_LOGD(
+        "[http] connected {} (tls={} endpoints={} elapsed={} ms)",
+        hostPort,
+        key.https,
+        endpoints.size(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - connectStarted
+        )
+            .count()
+    );
     co_return conn;
 }
 
@@ -765,9 +921,67 @@ asio::awaitable<asio::ip::tcp::resolver::results_type> HttpClient::asyncResolveW
     std::chrono::steady_clock::time_point connectDeadline,
     std::chrono::milliseconds             connectTimeout
 ) {
+    // 缓存命中直接返回: 省掉一次 getaddrinfo, 也避开解析器抖动导致的失败
+    const auto key = dnsCacheKey(host, port);
+    if (auto cached = dnsCacheLookup(key)) {
+        co_return *cached;
+    }
+
     auto executor = co_await asio::this_coro::executor;
     auto state    = startDnsResolve(executor, std::string{host}, std::string{port});
-    co_return co_await waitDnsResolve(state, connectDeadline, connectTimeout);
+    try {
+        auto results = co_await waitDnsResolve(state, connectDeadline, connectTimeout);
+        dnsCacheStore(key, results);
+        co_return results;
+    } catch (const utilxx_base::AsioSystemError& e) {
+        // 外部取消不是解析失败, 原样抛出 (否则会把取消当成"用旧地址重来")
+        if (e.code() == asio::error::operation_aborted) {
+            throw;
+        }
+        if (auto stale = dnsCacheFind(key)) {
+            ++g_dnsCacheStale;
+            XX_LOGW(
+                "HttpClient DNS resolve failed for {} ({}), reusing last known addresses",
+                key,
+                e.what()
+            );
+            co_return *stale;
+        }
+        throw;
+    } catch (const std::exception& e) {
+        // 解析超时 (DNS 黑洞): 有上次成功的地址就先用着, 让请求继续尝试建连
+        if (auto stale = dnsCacheFind(key)) {
+            ++g_dnsCacheStale;
+            XX_LOGW(
+                "HttpClient DNS resolve timeout for {} after {} ms ({}), reusing last known addresses",
+                key,
+                connectTimeout.count(),
+                e.what()
+            );
+            co_return *stale;
+        }
+        throw;
+    }
+}
+
+HttpClient::DnsCacheStats HttpClient::dnsCacheStats() {
+    return DnsCacheStats{
+        g_dnsCacheHits.load(std::memory_order_relaxed),
+        g_dnsCacheMisses.load(std::memory_order_relaxed),
+        g_dnsCacheStale.load(std::memory_order_relaxed),
+    };
+}
+
+void HttpClient::clearDnsCache() {
+    std::lock_guard<std::mutex> lock(g_dnsCacheMtx);
+    g_dnsCache.clear();
+    g_dnsCacheHits.store(0, std::memory_order_relaxed);
+    g_dnsCacheMisses.store(0, std::memory_order_relaxed);
+    g_dnsCacheStale.store(0, std::memory_order_relaxed);
+}
+
+void HttpClient::setDnsCacheTtl(std::chrono::milliseconds ttl) noexcept {
+    g_dnsCacheTtlMs.store(ttl.count(), std::memory_order_relaxed);
 }
 
 std::string_view HttpResponse::findHeader(std::string_view name) const noexcept {
@@ -1355,6 +1569,105 @@ asio::awaitable<std::expected<HttpResponse, std::string>> HttpClient::requestAsy
     co_return result;
 }
 
+// ---------------------------------------------------------------------------
+// SSE 收尾 (后台读完终止块, 再把连接还回池)
+//
+// 为什么需要: `data: [DONE]` 只是应用层约定 (OpenAI 的写法), HTTP/1.1 的 chunked
+// 正文还要靠 0 长度块收尾。停在 `[DONE]` 时这条连接处在响应中间, 不能复用 (残留
+// 字节会与下一条响应错位), 只能关掉; 而"每次请求都重新建连"正是弱网下最容易
+// 失败的一步。
+//
+// 做法: 应用层回调返回 true 之后, 把连接、解析器、读缓冲交给后台协程, 由它读到
+// 正文结束 (最多 sseFinishGrace)。请求本身立即返回, 不额外等待。
+// ---------------------------------------------------------------------------
+
+using SseBodyParser = boost::beast::http::response_parser<boost::beast::http::string_body>;
+
+/// 后台收尾协程持有的状态
+/// - 解析器用 shared_ptr 持有: beast 的 parser **不可移动** (拷贝/移动均无),
+///   交换所有权只能靠共享指针
+/// - 析构时若还没归还连接, 按"不可复用"关闭 (例如 io_context 正在析构, 协程没跑)
+struct SseTailDrain {
+    SseTailDrain(
+        std::shared_ptr<PooledConnection> connection,
+        HttpPoolKey                       poolKey,
+        std::shared_ptr<SseBodyParser>    responseParser,
+        boost::beast::flat_buffer         readBuffer,
+        std::chrono::milliseconds         finishGrace
+    ) :
+        conn(std::move(connection)),
+        key(std::move(poolKey)),
+        parser(std::move(responseParser)),
+        buf(std::move(readBuffer)),
+        grace(finishGrace) {}
+
+    ~SseTailDrain() {
+        release(false);
+    }
+
+    SseTailDrain(const SseTailDrain&)            = delete;
+    SseTailDrain& operator=(const SseTailDrain&) = delete;
+
+    /// 归还连接 (恰好一次): `reusable` 为 true 且连接仍打开时进空闲桶, 否则关闭
+    void release(bool reusable) {
+        if (released) {
+            return;
+        }
+        released = true;
+        if (!conn) {
+            return;
+        }
+        // 进程退出期间连接池可能已先销毁 (静态析构逆序), 此时只关连接、不动池
+        if (g_poolAlive.load(std::memory_order_relaxed)) {
+            HttpConnectionPool::instance().release(key, std::move(conn), reusable);
+        }
+        conn.reset();
+    }
+
+    std::shared_ptr<PooledConnection> conn;
+    HttpPoolKey                       key;
+    std::shared_ptr<SseBodyParser>    parser;
+    boost::beast::flat_buffer         buf;
+    std::chrono::milliseconds         grace;
+    bool                              released = false;
+};
+
+/// 后台收尾: 读到正文结束标记为止 (期间丢弃字节, 不再交给调用方)
+asio::awaitable<void> drainSseTail(std::shared_ptr<SseTailDrain> state) {
+    const auto deadline = std::chrono::steady_clock::now() + state->grace;
+    try {
+        co_await std::visit(
+            [&](auto& stream) -> asio::awaitable<void> {
+                while (!state->parser->is_done()) {
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()
+                    );
+                    if (remaining.count() <= 0) {
+                        break;
+                    }
+                    co_await runSseOpWithTimeout(
+                        stream,
+                        remaining,
+                        "finish",
+                        [&]() -> asio::awaitable<void> {
+                            co_await boost::beast::http::async_read_some(
+                                stream,
+                                state->buf,
+                                *state->parser,
+                                asio::use_awaitable
+                            );
+                        }
+                    );
+                }
+            },
+            state->conn->stream
+        );
+    } catch (...) {
+        // 读超时 / EOF / 解析错误: 连接不可复用, 下面按 false 归还
+    }
+    state->release(state->parser->is_done() && state->parser->get().keep_alive());
+}
+
 asio::awaitable<void> HttpClient::requestSseAsync(
     std::string_view                      method,
     std::string_view                      url,
@@ -1415,7 +1728,11 @@ asio::awaitable<void> HttpClient::requestSseAsync(
     // 执行 SSE 交换; 返回连接是否可归还池复用 (流完整结束且服务端允许 keep-alive)。
     // - anyDelivered: 是否已向 onChunk 投递过数据; 投递后连接层失败不再重试
     //   (重试会向调用方重复投递数据), 由上层决定
-    auto doSseExchange = [&](auto& stream, bool& anyDelivered) -> asio::awaitable<bool> {
+    // - connRef: 当前连接; 收尾交给后台协程时会被移走 (置空), 调用方的归还随之变成空操作
+    auto doSseExchange
+        = [&](auto& stream, std::shared_ptr<PooledConnection>& connRef, bool& anyDelivered)
+        -> asio::awaitable<bool> {
+        auto executor = co_await asio::this_coro::executor;
         // 发送请求体: 服务器不读 body (如 TCP 窗口阻塞) 时写会长期挂起, 超时直接断开
         co_await runSseOpWithTimeout(
             stream,
@@ -1426,8 +1743,11 @@ asio::awaitable<void> HttpClient::requestSseAsync(
             }
         );
 
-        boost::beast::flat_buffer                buf;
-        http::response_parser<http::string_body> parser;
+        boost::beast::flat_buffer buf;
+        // 解析器用 shared_ptr 持有: 收尾要交给后台协程时直接共享它
+        // (beast 的 parser 不可移动, 不能靠 "移进协程帧" 的交权方式)
+        auto  parserPtr = std::make_shared<http::response_parser<http::string_body>>();
+        auto& parser    = *parserPtr;
         parser.body_limit(std::numeric_limits<uint64_t>::max());
 
         // 读响应头: 部分服务器/网关收到请求后迟迟不返回响应头, 超时直接断开
@@ -1506,16 +1826,33 @@ asio::awaitable<void> HttpClient::requestSseAsync(
             return stop;
         };
 
-        // 流结束处理: 若流已完整解析 (chunked 终止块已到达, 连接处于消息边界) 且
-        // 服务端允许 keep-alive, 连接可归还池复用; 否则必须主动断开 (避免对端
-        // keep-alive 不关闭时白等 readChunkTimeout)
-        auto stopReading = [&]() {
+        // 流结束处理 (应用层回调返回 true, 或正文已自然读完):
+        // - 正文已读完整 (chunked 终止块已到达): 连接处于消息边界, 按服务端意愿归还池
+        // - 正文没读完但应用层已收工: 交给后台协程读到终止块再归还 (本请求立即返回)
+        // - 移交不了 (未启用池 / 宽限为 0): 主动断开, 避免对端 keep-alive 不关闭时
+        //   白等 readChunkTimeout
+        auto finishReading = [&]() {
             if (parser.is_done()) {
                 reusable = parser.get().keep_alive();
-            } else {
-                utilxx_base::AsioErrorCode ignore;
-                stream.lowest_layer().close(ignore);
+                return;
             }
+            if (usePool && config.sseFinishGrace.count() > 0) {
+                auto state = std::make_shared<SseTailDrain>(
+                    std::move(connRef),
+                    poolKey,
+                    parserPtr,
+                    std::move(buf),
+                    config.sseFinishGrace
+                );
+                asio::co_spawn(
+                    executor,
+                    [state]() -> asio::awaitable<void> { co_await drainSseTail(state); },
+                    asio::detached
+                );
+                return;
+            }
+            utilxx_base::AsioErrorCode ignore;
+            stream.lowest_layer().close(ignore);
         };
 
         // 读 body 的块间上限: 允许调用方按当前流状态逐次收紧
@@ -1532,31 +1869,25 @@ asio::awaitable<void> HttpClient::requestSseAsync(
         };
 
         // 初始 flush: 响应头与首个 body 数据可能在同一数据块中到达
-        if (flushBody()) {
-            stopReading();
+        bool appDone = flushBody();
+        while (!appDone && !parser.is_done()) {
+            // 读 body: 每次读操作独立计时 (块间最大间隔), 超时断开
+            co_await runSseOpWithTimeout(
+                stream,
+                nextBodyReadTimeout(),
+                "read-body",
+                [&]() -> asio::awaitable<void> {
+                    co_await http::async_read_some(stream, buf, parser, asio::use_awaitable);
+                }
+            );
+            appDone = flushBody();
+        }
+        if (appDone) {
+            finishReading();
         } else {
-            while (!parser.is_done()) {
-                // 读 body: 每次读操作独立计时 (块间最大间隔), 超时断开
-                co_await runSseOpWithTimeout(
-                    stream,
-                    nextBodyReadTimeout(),
-                    "read-body",
-                    [&]() -> asio::awaitable<void> {
-                        co_await http::async_read_some(stream, buf, parser, asio::use_awaitable);
-                    }
-                );
-                if (flushBody()) {
-                    stopReading();
-                    break;
-                }
-            }
-            // 自然结束 (循环因 parser.is_done() 退出): 连接处于消息边界
-            if (!reusable) {
-                flushBody();
-                if (parser.is_done()) {
-                    reusable = parser.get().keep_alive();
-                }
-            }
+            // 循环因正文读完退出 (消息边界): 最后一段交给 onChunk 后即可归还
+            flushBody();
+            reusable = parser.is_done() && parser.get().keep_alive();
         }
         co_return reusable;
     };
@@ -1578,7 +1909,7 @@ asio::awaitable<void> HttpClient::requestSseAsync(
         try {
             poolable = co_await std::visit(
                 [&](auto& stream) -> asio::awaitable<bool> {
-                    co_return co_await doSseExchange(stream, anyDelivered);
+                    co_return co_await doSseExchange(stream, conn, anyDelivered);
                 },
                 conn->stream
             );

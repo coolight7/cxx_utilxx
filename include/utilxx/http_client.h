@@ -127,6 +127,15 @@ struct RequestConfig {
 
     /// 覆盖 SNI 与主机名校验用的名字（为空 = 用 URL 里的主机名）
     std::string sslServerName;
+
+    /// 流式请求（SSE）的收尾宽限: 应用层在回调里返回 true 表示“流已结束”之后,
+    /// HTTP 层继续读到响应正文的结束标记（chunked 的 0 长度块）的最长时间, 读完
+    /// 才能把连接还回连接池复用; 读不到就关连接。
+    ///
+    /// - 这段时间在**后台**进行, 请求本身立即返回, 不影响调用方;
+    /// - 0 表示不等（旧行为, 连接直接关掉）;
+    /// - 仅对 `keepAlive = true` 的请求生效。
+    std::chrono::milliseconds sseFinishGrace = std::chrono::seconds{1};
 };
 
 class UTILXX_API HttpClient {
@@ -373,6 +382,22 @@ public:
 
     /// 关闭并清空所有空闲连接 (测试收尾/io_context 销毁前使用; 不影响借出的连接)
     static void clearConnectionPool();
+
+    /// DNS 缓存统计（进程级）
+    struct DnsCacheStats {
+        size_t hit   = 0; ///< 命中且未过期
+        size_t miss  = 0; ///< 未命中（含已关闭缓存）
+        size_t stale = 0; ///< 解析失败/超时后回退到过期结果
+    };
+
+    /// 查询 DNS 缓存统计（测试与诊断用）
+    static DnsCacheStats dnsCacheStats();
+
+    /// 清空 DNS 缓存（测试用; 统计计数同时归零）
+    static void clearDnsCache();
+
+    /// 设置 DNS 缓存有效期（默认 60 秒; 0 = 不缓存, 测试用）
+    static void setDnsCacheTtl(std::chrono::milliseconds ttl) noexcept;
 
     static asio::awaitable<std::expected<HttpResponse, std::string>> getAsync(
         std::string_view     url,
